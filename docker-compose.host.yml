@@ -1,0 +1,46 @@
+# docker-compose.host.yml — for when you ALREADY run some of these natively.
+#
+#   cp docker-compose.host.yml docker-compose.override.yml
+#   # then edit docker-compose.yml to delete the service blocks you don't want
+#   make up
+#
+# This file only repoints connection strings. It does NOT try to disable the
+# containers, because every trick for that (profiles, !override, scale: 0)
+# depends on a Compose version and fails in a confusing way on the others.
+# Deleting the four lines of a service block from docker-compose.yml is uglier
+# and always works.
+#
+# What to delete from docker-compose.yml for each service you keep native:
+#   - the whole service block
+#   - its entry under gateway/bootstrap `depends_on`
+#   - its volume from the top-level `volumes:` list
+#
+# BE AWARE — the Redpanda case is not symmetric with the others.
+# sql/kafka_sink.sql hardcodes kafka_broker_list='redpanda:9092' and ClickHouse
+# reads it from INSIDE the network. Keeping Redpanda native means editing that
+# SQL to host.docker.internal:19092, which is a schema edit rather than a config
+# edit. If you only containerise one thing, containerise Redpanda.
+
+services:
+
+  bootstrap:
+    # host.docker.internal resolves to your host from inside a container. It
+    # exists by default on Docker Desktop; on plain Linux Docker this line is
+    # what creates it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DATABASE_URL: postgresql://adplatform:${POSTGRES_PASSWORD:-adplatform}@host.docker.internal:5432/adplatform
+      REDIS_URL: redis://host.docker.internal:6379
+      # Leave these pointing at containers unless you also went native there.
+      KAFKA_BOOTSTRAP: redpanda:9092
+      CLICKHOUSE_HOST: clickhouse
+
+  gateway:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DATABASE_URL: postgresql://adplatform:${POSTGRES_PASSWORD:-adplatform}@host.docker.internal:5432/adplatform
+      REDIS_URL: redis://host.docker.internal:6379
+      KAFKA_BOOTSTRAP: redpanda:9092
+      CLICKHOUSE_HOST: clickhouse

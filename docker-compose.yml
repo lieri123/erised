@@ -1,0 +1,206 @@
+# docker-compose.yml — the full local stack.
+#
+#   docker compose up -d
+#   docker compose logs -f gateway
+#   ./scripts/verify_stack.sh
+#
+# Two hostname facts that cause most of the confusion here:
+#
+#   From INSIDE the network, Redpanda is redpanda:9092.
+#   From your HOST shell, it is localhost:19092.
+#
+# Those are two different listeners on the same broker, which is what the
+# --advertise-kafka-addr flag below configures. sql/kafka_sink.sql hardcodes
+# `kafka_broker_list = 'redpanda:9092'`, so the service MUST be named `redpanda`
+# — rename it and ClickHouse silently consumes nothing while every table still
+# looks correctly created.
+#
+# depends_on with condition: service_healthy makes compose wait for real
+# readiness rather than "the container started". bootstrap then runs to
+# completion before the gateway starts, so the gateway never races the schema.
+
+name: adplatform
+
+services:
+
+  # -------------------------------------------------------------------------
+  # Postgres — publishers, ads, impressions, clicks, conversions
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: adplatform
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adplatform}
+      POSTGRES_DB: adplatform
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -d and -U both matter: pg_isready with no database name reports ready
+      # slightly before the target database actually exists on first boot.
+      test: ["CMD-SHELL", "pg_isready -U adplatform -d adplatform"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # -------------------------------------------------------------------------
+  # Redis — daily budget counters (hot path, fail-open)
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # appendonly so budget counters survive a restart. They are recoverable from
+    # the impression log via reconcile(), but losing them means every advertiser
+    # gets a fresh daily budget at every deploy.
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # -------------------------------------------------------------------------
+  # Redpanda — Kafka-compatible event bus
+  # -------------------------------------------------------------------------
+  redpanda:
+    image: redpandadata/redpanda:v24.2.9
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+      # Off deliberately: bootstrap.py creates the three topics with the
+      # partition counts we want. With auto-create on, a typo'd topic name in
+      # publish_event() silently succeeds and creates a topic nobody reads.
+      - --set=redpanda.auto_create_topics_enabled=false
+    ports:
+      - "19092:19092"   # Kafka, from the host
+      - "9644:9644"     # admin API / metrics
+    volumes:
+      - redpandadata:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # -------------------------------------------------------------------------
+  # ClickHouse — impression/click logs, CTR aggregates, training queries
+  # -------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    restart: unless-stopped
+    environment:
+      # Deliberately NOT setting CLICKHOUSE_USER/CLICKHOUSE_PASSWORD. The image's
+      # entrypoint treats "default" as reserved and creating a second user named
+      # default has bitten people; the built-in passwordless default user is what
+      # settings.py already expects. Add a real user before this leaves your LAN —
+      # port 8123 is published and unauthenticated.
+      CLICKHOUSE_DB: default
+    ports:
+      - "8123:8123"   # HTTP — what clickhouse_connect uses
+      - "9000:9000"   # native protocol
+    volumes:
+      - chdata:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    cap_add:
+      - SYS_NICE
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # -------------------------------------------------------------------------
+  # Bootstrap — one shot, must finish before the gateway starts
+  # -------------------------------------------------------------------------
+  bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "scripts.bootstrap"]
+    restart: "no"
+    environment: &app_env
+      ENV: development
+      LOG_LEVEL: INFO
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      DATABASE_URL: postgresql://adplatform:${POSTGRES_PASSWORD:-adplatform}@postgres:5432/adplatform
+      KAFKA_BOOTSTRAP: redpanda:9092
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_DATABASE: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      REDIS_URL: redis://redis:6379
+      MODEL_DIR: /app/models/current
+      API_KEY_PEPPER: ${API_KEY_PEPPER:-dev-only-insecure-pepper}
+      BOOTSTRAP_API_KEY: ${BOOTSTRAP_API_KEY:-}
+      BOOTSTRAP_PUBLISHER_ID: ${BOOTSTRAP_PUBLISHER_ID:-pub_demo}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # Gateway
+  # -------------------------------------------------------------------------
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command:
+      - uvicorn
+      - adplatform.gateway:app
+      - --host=0.0.0.0
+      - --port=8000
+      - --proxy-headers
+    environment: *app_env
+    ports:
+      - "8000:8000"
+    volumes:
+      # Model artifacts are written by the training job on the host and read by
+      # the running gateway. model_refresh_loop picks up a new artifact within
+      # MODEL_REFRESH_SECONDS with no restart.
+      - ./models:/app/models
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+volumes:
+  pgdata:
+  redisdata:
+  redpandadata:
+  chdata:
