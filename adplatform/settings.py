@@ -151,6 +151,37 @@ class Settings:
         )
     )
 
+    # -- auth / admin ---------------------------------------------------------
+    # HMAC pepper for api_key hashing (auth.hash_api_key). The insecure default
+    # below is caught by validate_for_production() — it must never be the real
+    # value once ENV=production, since anyone who read this repo knows it.
+    api_key_pepper: str = field(
+        default_factory=lambda: _str("API_KEY_PEPPER", "dev-only-insecure-pepper")
+    )
+    api_key_refresh_seconds: int = field(
+        default_factory=lambda: _int("API_KEY_REFRESH_SECONDS", 60)
+    )
+    # How often should_write_last_used() lets a key's last_used_at actually hit
+    # Postgres. See the comment block at the bottom of auth.py.
+    last_used_write_interval: int = field(
+        default_factory=lambda: _int("LAST_USED_WRITE_INTERVAL", 300)
+    )
+    # Shared static token guarding /admin/*. Empty means the admin API is
+    # disabled (require_admin returns 503) rather than open.
+    admin_token: str = field(default_factory=lambda: _str("ADMIN_TOKEN", ""))
+    # Lets a fresh install authenticate its first request before any publisher
+    # row exists. auth._bootstrap_keys() refuses to activate this in production
+    # regardless of what it is set to.
+    bootstrap_api_key: str = field(default_factory=lambda: _str("BOOTSTRAP_API_KEY", ""))
+    bootstrap_publisher_id: str = field(
+        default_factory=lambda: _str("BOOTSTRAP_PUBLISHER_ID", "pub_demo")
+    )
+
+    # -- inventory ------------------------------------------------------------
+    inventory_refresh_seconds: int = field(
+        default_factory=lambda: _int("INVENTORY_REFRESH_SECONDS", 60)
+    )
+
     # -- model + stats refresh ----------------------------------------------
     model_dir: str = field(default_factory=lambda: _str("MODEL_DIR", "models/current"))
     model_refresh_seconds: int = field(
@@ -189,6 +220,37 @@ class Settings:
     @property
     def is_production(self) -> bool:
         return self.env.lower() in {"prod", "production"}
+
+    def validate_for_production(self) -> list[str]:
+        """
+        Config problems that are silent at runtime but should be fatal at boot.
+        Called once, in the lifespan, before anything else starts. Returns an
+        empty list outside production — a dev box is allowed to run on defaults.
+        """
+        if not self.is_production:
+            return []
+
+        problems = []
+        if self.api_key_pepper == "dev-only-insecure-pepper" or not self.api_key_pepper:
+            problems.append(
+                "API_KEY_PEPPER is unset or still the insecure default — "
+                "every stored api_key hash is forgeable by anyone who read this repo"
+            )
+        if self.bootstrap_api_key:
+            problems.append(
+                "BOOTSTRAP_API_KEY is set in production — remove it, it is a "
+                "standing credential outside the normal key table"
+            )
+        if not self.admin_token:
+            problems.append(
+                "ADMIN_TOKEN is unset — /admin/* will 503 for everyone, "
+                "including you"
+            )
+        if not self.clickhouse_password:
+            problems.append(
+                "CLICKHOUSE_PASSWORD is empty — port 8123 is unauthenticated"
+            )
+        return problems
 
     def describe(self) -> str:
         """One-line summary for the startup log. Never logs secrets."""
