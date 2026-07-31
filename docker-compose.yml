@@ -87,7 +87,8 @@ services:
       # Off deliberately: bootstrap.py creates the three topics with the
       # partition counts we want. With auto-create on, a typo'd topic name in
       # publish_event() silently succeeds and creates a topic nobody reads.
-      - --set=redpanda.auto_create_topics_enabled=false
+      - --set
+      - redpanda.auto_create_topics_enabled=false
     ports:
       - "19092:19092"   # Kafka, from the host
       - "9644:9644"     # admin API / metrics
@@ -112,12 +113,29 @@ services:
       # default has bitten people; the built-in passwordless default user is what
       # settings.py already expects. Add a real user before this leaves your LAN —
       # port 8123 is published and unauthenticated.
-      CLICKHOUSE_DB: default
+      #
+      # CLICKHOUSE_SKIP_USER_SETUP=1: kept for simplicity even though it turned
+      # out not to be the fix for the startup hang below (the "network access
+      # disabled for default" restriction still permits 127.0.0.1, which is all
+      # the entrypoint's own init step needs). The real cause was a listen-port
+      # race + failed IPv6 binds — see listen.xml mounted below.
+      CLICKHOUSE_SKIP_USER_SETUP: 1
+      # CLICKHOUSE_DB is deliberately NOT set. "default" already exists as a
+      # built-in ClickHouse database regardless — setting CLICKHOUSE_DB (even
+      # to "default") makes the entrypoint spin up a whole temporary internal
+      # server just to run CREATE DATABASE IF NOT EXISTS, then kill it and
+      # start the real server in its place. That kill -> rebind handoff is
+      # where a listen-port race lives; on WSL2's slower socket teardown the
+      # real server consistently loses the race and ends up with zero bound
+      # ports (see docker/clickhouse-startup-race.md if that file exists, or
+      # the git history on this line otherwise). Not setting it skips that
+      # whole path — the server binds its ports once, directly, on first exec.
     ports:
       - "8123:8123"   # HTTP — what clickhouse_connect uses
       - "9000:9000"   # native protocol
     volumes:
       - chdata:/var/lib/clickhouse
+      - ./clickhouse-config/listen.xml:/etc/clickhouse-server/config.d/listen.xml:ro
     ulimits:
       nofile:
         soft: 262144
@@ -125,7 +143,7 @@ services:
     cap_add:
       - SYS_NICE
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://localhost:8123/ping || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8123/ping || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 20

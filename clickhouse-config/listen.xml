@@ -1,0 +1,11 @@
+<clickhouse>
+    <!-- This WSL2 environment has no usable IPv6 (confirmed separately via
+         Docker Hub connectivity tests during setup) — ClickHouse's default
+         config listens on both 0.0.0.0 and :: by default in the docker image,
+         and every IPv6 bind here fails with "Address family for hostname not
+         supported". Pinning to IPv4-only removes those failed attempts and
+         the retry/race window around them during the entrypoint's handoff
+         from its temporary init-only server to the real one. -->
+    <listen_host>0.0.0.0</listen_host>
+    <listen_try>1</listen_try>
+</clickhouse>

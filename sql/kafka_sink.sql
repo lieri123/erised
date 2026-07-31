@@ -103,7 +103,7 @@ AS SELECT
     ad_id,
     placement_id
 FROM kafka_clicks
-WHERE impression_id != '';
+WHERE kafka_clicks.impression_id != '';
  
  
 -- ---------------------------------------------------------------------------
