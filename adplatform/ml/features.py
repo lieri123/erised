@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
  
-FEATURE_VERSION = 1
+FEATURE_VERSION = 2
  
 # Order is load-bearing. XGBoost consumes a positional array; if you reorder
 # this list without bumping the version, every existing model becomes wrong
