@@ -400,7 +400,10 @@ async def bid(
     # impression costs one thousandth of it. Using win_price here would burn a
     # $500 daily budget in about 125 impressions.
     if request.app.state.budget is not None:
-        spawn(request.app.state.budget.record_spend(winner.ad.ad_id, result.cost_usd),
+        # Charge the CAMPAIGN, not the ad. daily_budget_usd is a campaign
+        # property; keying spend on ad_id gave a three-creative campaign three
+        # independent counters and let it spend 3x its budget.
+        spawn(request.app.state.budget.record_spend(winner.ad.campaign_id, result.cost_usd),
               name="record-spend")
 
     # Postgres row — powers the click lookup. destination_url is what lets

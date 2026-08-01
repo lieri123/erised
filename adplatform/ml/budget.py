@@ -34,9 +34,22 @@ return v
 """
 
 
-def budget_key(ad_id: str, day: str | None = None) -> str:
+def budget_key(campaign_id: str, day: str | None = None) -> str:
+    """
+    Redis key for one campaign's spend on one UTC day.
+
+    KEYED ON CAMPAIGN, NOT AD. daily_budget_usd is a property of the campaign,
+    so a campaign with three creatives must share one counter. Keying on ad_id
+    gave each creative its own counter measured against the full campaign
+    budget -- 3x overspend, every counter reporting itself healthy.
+
+    The namespace is deliberately "budget:camp:" rather than the old "budget:".
+    A campaign_id could otherwise collide with an ad_id from the pre-migration
+    era and silently inherit its spend. Distinct prefixes make the cutover
+    total: old keys are unreachable and expire on their own TTL.
+    """
     day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return f"budget:{ad_id}:{day}"
+    return f"budget:camp:{campaign_id}:{day}"
 
 
 def impression_cost_usd(win_price_cpm: float) -> float:
@@ -64,13 +77,15 @@ class BudgetTracker:
 
     # -- read path (hot) ----------------------------------------------------
 
-    async def get_spend(self, ad_ids: list[str]) -> dict[str, float]:
+    async def get_spend(self, campaign_ids: list[str]) -> dict[str, float]:
         """
-        Batch-fetch today's spend for many ads in ONE round trip.
+        Batch-fetch today's spend for many campaigns in ONE round trip.
 
-        Deliberately not one GET per ad: a 40-ad eligible set would mean 40
-        sequential round trips, which at 0.2ms each is 8ms of your 20ms budget
-        spent waiting on a cache.
+        Deliberately not one GET per campaign: a 40-ad eligible set would mean
+        up to 40 sequential round trips, which at 0.2ms each is 8ms of your 20ms
+        budget spent waiting on a cache. Callers should de-duplicate to campaign
+        ids first -- several creatives usually share one campaign, so the MGET is
+        typically smaller than the candidate set.
 
         FAIL-OPEN on Redis errors. The alternative — refusing to bid — turns a
         cache outage into a total revenue outage, and any overspend during the
@@ -78,22 +93,22 @@ class BudgetTracker:
         reconcile(). Failing closed protects a number that is already recoverable
         at the cost of the only thing that isn't: the auction you cannot re-run.
         """
-        if not ad_ids:
+        if not campaign_ids:
             return {}
         try:
-            keys = [budget_key(a) for a in ad_ids]
+            keys = [budget_key(c) for c in campaign_ids]
             values = await self.redis.mget(keys)
             return {
-                ad_id: float(v) if v is not None else 0.0
-                for ad_id, v in zip(ad_ids, values)
+                cid: float(v) if v is not None else 0.0
+                for cid, v in zip(campaign_ids, values)
             }
         except Exception:
             log.exception("budget read failed; failing open (spend treated as 0)")
-            return {ad_id: 0.0 for ad_id in ad_ids}
+            return {cid: 0.0 for cid in campaign_ids}
 
     # -- write path (after the auction, off the critical path) ---------------
 
-    async def record_spend(self, ad_id: str, cost_usd: float) -> float | None:
+    async def record_spend(self, campaign_id: str, cost_usd: float) -> float | None:
         """
         Increment after a win. Call via spawn(), not awaited inline — the bid
         response should not wait on it.
@@ -103,14 +118,21 @@ class BudgetTracker:
         impression log; without reconciliation this would be a silent
         under-count that lets advertisers overspend.
         """
+        if not campaign_id:
+            # An ad with no campaign cannot be charged to a budget. Loud, because
+            # silently skipping the increment is how an advertiser serves for free.
+            log.error("record_spend called with no campaign_id (cost=%.6f) -- "
+                      "spend NOT recorded", cost_usd)
+            return None
         try:
             script = await self._ensure_script()
             new_total = await script(
-                keys=[budget_key(ad_id)], args=[cost_usd, KEY_TTL_SECONDS]
+                keys=[budget_key(campaign_id)], args=[cost_usd, KEY_TTL_SECONDS]
             )
             return float(new_total)
         except Exception:
-            log.exception("budget increment failed for ad=%s cost=%.6f", ad_id, cost_usd)
+            log.exception("budget increment failed for campaign=%s cost=%.6f",
+                          campaign_id, cost_usd)
             return None
 
     # -- reconciliation (periodic) ------------------------------------------
@@ -124,15 +146,28 @@ class BudgetTracker:
         corrected here from the log that actually persisted.
 
         Note SUM(win_price) / 1000 — the log stores CPM, budgets are in dollars.
+
+        GROUPS BY campaign_id to match the enforcement key. Grouping by ad_id
+        while enforcement reads campaign keys would be worse than not
+        reconciling at all: it would write ad-keyed values nobody reads, and the
+        campaign keys would never be rebuilt after a Redis restart -- so every
+        campaign would silently reset to zero spend and serve a second full
+        budget.
+
+        Rows with an empty campaign_id are excluded. Those are impressions
+        served before migration 003 added the column; they have no campaign to
+        charge, and folding them into any single campaign would overstate it.
+        They remain in the table for training, which does not care.
         """
         import asyncio
 
         day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         query = """
-            SELECT ad_id, sum(win_price) / 1000.0 AS spent_usd
+            SELECT campaign_id, sum(win_price) / 1000.0 AS spent_usd
             FROM ad_impressions
             WHERE toDate(ts) = {day:Date}
-            GROUP BY ad_id
+              AND campaign_id != ''
+            GROUP BY campaign_id
         """
         try:
             rows = (await asyncio.to_thread(
@@ -143,19 +178,19 @@ class BudgetTracker:
             return {}
 
         corrected: dict[str, float] = {}
-        for ad_id, spent in rows:
+        for campaign_id, spent in rows:
             spent = float(spent)
-            key = budget_key(ad_id, day)
+            key = budget_key(campaign_id, day)
             try:
                 previous = await self.redis.get(key)
                 previous = float(previous) if previous else 0.0
                 if abs(previous - spent) > 0.001:
-                    log.info("budget drift ad=%s redis=%.4f actual=%.4f",
-                             ad_id, previous, spent)
+                    log.info("budget drift campaign=%s redis=%.4f actual=%.4f",
+                             campaign_id, previous, spent)
                 await self.redis.set(key, spent, ex=KEY_TTL_SECONDS)
-                corrected[ad_id] = spent
+                corrected[campaign_id] = spent
             except Exception:
-                log.exception("failed to reconcile budget for ad=%s", ad_id)
+                log.exception("failed to reconcile budget for campaign=%s", campaign_id)
 
         return corrected
 
@@ -194,5 +229,25 @@ async def filter_by_budget(ads: list, tracker: BudgetTracker) -> list:
     """
     if not ads:
         return []
-    spend = await tracker.get_spend([ad.ad_id for ad in ads])
-    return [ad for ad in ads if spend.get(ad.ad_id, 0.0) < ad.daily_budget_usd]
+
+    # De-duplicate to campaigns before hitting Redis. Several creatives normally
+    # share one campaign, so this makes the MGET smaller than the candidate set,
+    # not larger.
+    campaign_ids = list({ad.campaign_id for ad in ads if ad.campaign_id})
+
+    spend = await tracker.get_spend(campaign_ids) if campaign_ids else {}
+
+    kept = []
+    for ad in ads:
+        if not ad.campaign_id:
+            # No campaign means no budget to check and no way to charge the
+            # spend. Dropping it is the conservative choice: serving free
+            # impressions is worse than not serving. In practice this cannot
+            # happen -- servable_ads joins through campaigns -- so it means the
+            # inventory row is malformed.
+            log.warning("ad %s has no campaign_id; excluding from auction", ad.ad_id)
+            continue
+        if spend.get(ad.campaign_id, 0.0) < ad.daily_budget_usd:
+            kept.append(ad)
+
+    return kept

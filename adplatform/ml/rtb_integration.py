@@ -277,6 +277,13 @@ def build_impression_event(result: AuctionResult, ctx: RequestContext) -> dict:
         "publisher_id": ctx.publisher_id,
         "placement_id": ctx.placement_id,
         "ad_id": winner.ad.ad_id,
+        # Required by budget.reconcile(), which GROUPs BY campaign_id to rebuild
+        # Redis from this log. Safe to emit before migration 003 is applied:
+        # kafka_impressions sets input_format_skip_unknown_fields = 1, so an
+        # unrecognised field is ignored rather than rejected. "" rather than
+        # None because the ClickHouse column is a non-nullable LowCardinality
+        # (String) and JSONEachRow will not coerce a null into it.
+        "campaign_id": winner.ad.campaign_id or "",
         "advertiser_id": winner.ad.advertiser_id,
         "device_type": ctx.device_type,
         "feature_version": FEATURE_VERSION,

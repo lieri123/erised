@@ -206,7 +206,17 @@ async def apply_clickhouse() -> None:
         connect,
     )
 
-    for filename in ("schema.sql", "kafka_sink.sql"):
+    # Order matters. schema.sql creates the destination tables, kafka_sink.sql
+    # creates the consumers and MVs that write into them, and numbered
+    # migrations then alter both. 003 drops and recreates kafka_impressions, so
+    # it MUST run after kafka_sink.sql, not before.
+    #
+    # Every file here is idempotent (IF EXISTS / IF NOT EXISTS), which is what
+    # lets bootstrap re-run on every `docker compose up` without a migrations
+    # table. That stops being true the moment someone writes a migration with a
+    # bare ALTER -- at which point this list should be replaced with a real
+    # migration runner that records what it has applied.
+    for filename in ("schema.sql", "kafka_sink.sql", "003_campaign_budgets.sql"):
         path = SQL_DIR / filename
         if not path.exists():
             log.error("%s missing — skipping", filename)
