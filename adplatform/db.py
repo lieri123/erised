@@ -587,6 +587,39 @@ async def list_api_keys(publisher_id: str) -> list[dict[str, Any]]:
         return []
 
 
+async def touch_api_key(key_id: str) -> None:
+    """
+    Stamp last_used_at. Called from gateway.note_key_usage via spawn(), already
+    throttled by auth.should_write_last_used to one write per key per
+    last_used_write_interval (default 300s).
+
+    That throttle is why this can be a plain UPDATE with no upsert or contention
+    handling: at most one write per key per five minutes, and a lost race just
+    means the timestamp is a few minutes stale. last_used_at is an operational
+    breadcrumb for "is this key still in use before I revoke it", not an audit
+    log — do not build billing or security decisions on it.
+
+    Swallows its own exceptions like every other spawn() target here. A failed
+    timestamp write must never surface as a failed bid.
+
+    NOTE: gateway.py:307 called this function before it existed, which raised
+    AttributeError while evaluating the argument to spawn() — i.e. on the
+    caller's stack, before the task was ever created, so the fire-and-forget
+    error isolation did not apply. Every authenticated endpoint returned 500;
+    only /health worked, because it does not authenticate.
+    """
+    if _pool is None:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE api_keys SET last_used_at = now() WHERE key_id = $1",
+                key_id,
+            )
+    except Exception:
+        log.exception("touch_api_key failed for %s", key_id)
+
+
 async def revoke_api_key(key_id: str) -> Optional[str]:
     """Marks the key revoked and returns its key_hash so the caller can evict
     it from the in-memory auth cache immediately. None if unknown/already revoked."""

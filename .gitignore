@@ -1,0 +1,30 @@
+# Local config — copy .env.example instead. Contains the API key pepper and
+# admin token; both are credentials even in development.
+.env
+.env.*
+!.env.example
+
+# Trained model artifacts. Rebuilt by `python -m ml.train_ctr`, and a booster
+# plus calibrator is binary weight that does not belong in git history.
+models/*
+!models/.gitkeep
+
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+*.egg-info/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Docker named volumes bind here if you switch to host paths.
+data/
+
+.DS_Store
+.idea/
+.vscode/
