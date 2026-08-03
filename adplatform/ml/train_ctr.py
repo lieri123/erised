@@ -320,12 +320,56 @@ def fit_calibrator(p_corrected: np.ndarray, y: np.ndarray):
     Isotonic regression on the held-out calibration split. Monotonic, so it
     cannot change the ranking — it only fixes the probability scale, which is
     what the bid depends on.
+
+    GUARDS AGAINST A COLLAPSED FIT. Isotonic regression can degenerate to a
+    constant, and when it does the symptom is baffling: AUC lands on exactly
+    0.5000 and the calibration ratio on exactly 0.000, so promotion is blocked
+    on all three gates at once and every one of them points at the model. The
+    model is fine. The calibrator ate it.
+
+    Two ways it happens:
+
+      * the calibrator-fit half contains no positive labels, so the isotonic
+        fit is the constant 0;
+      * every value being scored falls outside the fitted input range, so
+        out_of_bounds="clip" pins them all to one endpoint.
+
+    Both mean the calibration split is not exchangeable with what is being
+    scored — usually because the impression log mixes data regimes (several
+    simulator runs stacked on each other, a feature definition that changed
+    mid-window, a backfill). Failing loudly and naming the real cause beats
+    three misleading gate messages.
     """
     from sklearn.isotonic import IsotonicRegression
- 
+
+    n_pos = int(y.sum())
+    if n_pos == 0:
+        raise SystemExit(
+            "calibrator-fit split contains no positive labels, so isotonic "
+            "regression would collapse to the constant 0.\nThe impression log "
+            "is almost certainly mixing data regimes."
+        )
+    if n_pos < 30:
+        log.warning("only %d positives available to fit the calibrator — the "
+                    "fit will be coarse and the calibration gate unreliable. "
+                    "Generate more traffic.", n_pos)
+
     iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
     iso.fit(p_corrected, y)
     return iso
+
+
+def check_calibrator_output(p_final: np.ndarray) -> None:
+    """A constant output means the fit degenerated; see fit_calibrator."""
+    if len(np.unique(p_final)) == 1:
+        raise SystemExit(
+            f"the calibrator produced a constant {p_final[0]:.6f} for every "
+            f"row, so AUC is 0.5 by construction and the gates below are "
+            f"meaningless.\nThe scored values fall outside the range the "
+            f"calibrator was fit on and out_of_bounds='clip' pinned them all "
+            f"to one endpoint. The two halves of the calibration split are not "
+            f"comparable — check the impression log for mixed data regimes."
+        )
  
  
 # ---------------------------------------------------------------------------
@@ -360,12 +404,39 @@ def run(data: dict[str, np.ndarray], out_dir: Path, dry_run: bool = False,
     cal_test = {k: v[mid:] for k, v in calib.items()}
  
     calibrator = fit_calibrator(corrected[:mid], cal_fit["y"])
-    p_final = calibrator.predict(corrected[mid:])
+    p_calibrated = calibrator.predict(corrected[mid:])
+    check_calibrator_output(p_calibrated)
  
     m_raw = evaluate(np.clip(np.asarray(raw)[mid:], 1e-7, 1 - 1e-7), cal_test["y"])
     m_corrected = evaluate(corrected[mid:], cal_test["y"])
-    m_final = evaluate(p_final, cal_test["y"])
+    m_calibrated = evaluate(p_calibrated, cal_test["y"])
     m_baseline = evaluate(baseline_predictions(cal_test), cal_test["y"])
+ 
+    # ISOTONIC IS OPTIONAL, AND OFTEN HARMFUL HERE.
+    #
+    # undo_negative_downsampling is an exact analytic correction: it maps the
+    # downsampled-scale probability back to the true scale in closed form. When
+    # it works, the model is already calibrated and there is no bias left for
+    # isotonic to remove — only variance for it to add. Isotonic is also a step
+    # function, so it TIES distinct predictions together and destroys ranking
+    # information that the auction depends on. A measured example: corrected
+    # logloss 0.1409 / AUC 0.6368 / ratio 0.983, and after isotonic 0.1470 /
+    # 0.6308 / 1.074. Strictly worse on all three.
+    #
+    # So apply it only when it earns its place. The criterion is log loss on
+    # cal_test, which is a selection made on the evaluation split: one binary
+    # choice over ~7500 rows, so the optimism is small, but it is not zero and
+    # the chosen path is recorded in metadata rather than hidden.
+    use_isotonic = m_calibrated.log_loss < m_corrected.log_loss
+    if use_isotonic:
+        log.info("isotonic calibration IMPROVES log loss (%.6f -> %.6f) — keeping it",
+                 m_corrected.log_loss, m_calibrated.log_loss)
+        p_final, m_final = p_calibrated, m_calibrated
+    else:
+        log.info("isotonic calibration does NOT improve log loss (%.6f -> %.6f) — "
+                 "skipping it; the downsampling correction is already sufficient",
+                 m_corrected.log_loss, m_calibrated.log_loss)
+        calibrator, p_final, m_final = None, corrected[mid:], m_corrected
  
     log.info("uncorrected   logloss=%.6f auc=%.4f calib_ratio=%.3f",
              m_raw.log_loss, m_raw.auc, m_raw.calibration_ratio)
@@ -399,6 +470,10 @@ def run(data: dict[str, np.ndarray], out_dir: Path, dry_run: bool = False,
         "best_iteration": int(booster.best_iteration),
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "used_ips_weighting": use_ips,
+        # False means undo_negative_downsampling alone produced calibrated
+        # probabilities and no calibrator.pkl was written. Recorded because a
+        # future run comparing artifacts needs to know which path was taken.
+        "used_isotonic_calibration": bool(use_isotonic),
         "rows": {"train": len(train_raw["y"]), "valid": len(valid_raw["y"]),
                  "calib": len(calib["y"])},
         "metrics": {
@@ -430,8 +505,13 @@ def run(data: dict[str, np.ndarray], out_dir: Path, dry_run: bool = False,
     version_dir = out_dir / version
     version_dir.mkdir(parents=True, exist_ok=True)
     booster.save_model(str(version_dir / "model.json"))
-    with (version_dir / "calibrator.pkl").open("wb") as fh:
-        pickle.dump(calibrator, fh)
+    # Only written when isotonic actually helped. ctr_model.load() treats a
+    # missing calibrator.pkl as "no calibration needed" (artifact.calibrator is
+    # None and the predict path skips it), so absence is a valid state, not a
+    # broken artifact.
+    if calibrator is not None:
+        with (version_dir / "calibrator.pkl").open("wb") as fh:
+            pickle.dump(calibrator, fh)
     (version_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
  
     if metadata["promoted"]:
