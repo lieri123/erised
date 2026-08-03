@@ -91,6 +91,19 @@ class Settings:
         default_factory=lambda: _str("PUBLIC_BASE_URL", "http://localhost:8000")
     )
 
+    # How long a signed click URL stays valid. This is a genuine trade-off, not
+    # a tuning knob to max out:
+    #
+    #   too short — a user opens an article in a background tab, clicks twenty
+    #     minutes later, and gets a 403 instead of the advertiser's page. The
+    #     advertiser paid for that impression and lost the visit.
+    #   too long — a scraped click URL stays forgeable for that whole window.
+    #
+    # 24h is the industry norm and matches a typical click-attribution window.
+    click_url_ttl_seconds: int = field(
+        default_factory=lambda: _int("CLICK_URL_TTL_SECONDS", 60 * 60 * 24)
+    )
+
     # -- Postgres -----------------------------------------------------------
     database_url: str = field(
         default_factory=lambda: _str(

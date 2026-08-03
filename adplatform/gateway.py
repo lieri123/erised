@@ -64,6 +64,7 @@ from .ml.rtb_integration import build_impression_event, run_rtb
 from .inventory import invalidate as invalidate_inventory
 from .inventory import load_inventory, refresh_inventory_loop
 from .settings import settings
+from .signing import ClickSignatureError, build_click_url, verify_click
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -429,8 +430,11 @@ async def bid(
         "page_url": bid_request.page_url,
     }), name="impression-event")
 
+    # Signed. An unsigned click URL is a forgeable training label: anyone who
+    # scrapes an impression_id out of a publisher page can manufacture a click
+    # for whichever ad they like. See signing.py.
     ad_markup = winner.ad.creative_html.replace(
-        "{{CLICK_URL}}", f"{settings.public_base_url}/v1/click?id={impression_id}")
+        "{{CLICK_URL}}", build_click_url(impression_id))
 
     response = JSONResponse(content={
         "impression_id": impression_id,
@@ -449,7 +453,11 @@ async def bid(
 
 @app.get("/v1/click", tags=["Tracking"],
          summary="Record a click then redirect to the advertiser")
-async def track_click(id: str = Query(..., description="impression_id")):
+async def track_click(
+    id: str = Query(..., description="impression_id"),
+    exp: int | None = Query(None, description="signature expiry (unix seconds)"),
+    sig: str | None = Query(None, description="HMAC signature"),
+):
     """
     No `redirect` parameter. The destination is read from the impression row,
     so there is nothing for an attacker to point elsewhere.
@@ -457,7 +465,26 @@ async def track_click(id: str = Query(..., description="impression_id")):
     The old version accepted any http(s) URL as a query parameter and redirected
     to it even when the impression_id did not exist — a fully open redirect
     requiring no valid id at all.
+
+    SIGNATURE REQUIRED. exp and sig are minted per impression in build_click_url
+    and verified here. Without them any leaked impression_id could be replayed
+    into a training label — see the header of signing.py for why that matters
+    more than it sounds.
     """
+    if exp is None or sig is None:
+        # Almost always an old creative served before signing shipped, or a
+        # hand-built URL. Both look identical to an attack from here.
+        log.warning("unsigned click rejected | id=%s", id)
+        raise HTTPException(status_code=403, detail="Invalid or expired click URL")
+
+    try:
+        verify_click(id, exp, sig)
+    except ClickSignatureError as exc:
+        # The reason is logged, never returned. Telling a forger "expired"
+        # versus "signature mismatch" tells them which half to work on.
+        log.warning("click signature rejected | id=%s | %s", id, exc)
+        raise HTTPException(status_code=403, detail="Invalid or expired click URL")
+
     impression = await get_impression(id)
     if impression is None:
         log.warning("click on unknown impression | id=%s", id)

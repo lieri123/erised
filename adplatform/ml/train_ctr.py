@@ -41,18 +41,51 @@ SELECT
     i.features                        AS features,
     i.serve_propensity                AS serve_propensity,
     i.is_exploration                  AS is_exploration,
-    if(c.impression_id IS NULL, 0, 1) AS clicked
+    if(c.click_ts >= i.ts
+       AND c.click_ts <= i.ts + INTERVAL {attr_hours:UInt8} HOUR, 1, 0) AS clicked
 FROM ad_impressions AS i
-LEFT JOIN ad_clicks AS c
-    ON  i.impression_id = c.impression_id
-    AND c.ts >= i.ts
-    AND c.ts <= i.ts + INTERVAL {attr_hours:UInt8} HOUR
+LEFT JOIN (
+    SELECT impression_id, min(ts) AS click_ts
+    FROM ad_clicks
+    GROUP BY impression_id
+) AS c ON i.impression_id = c.impression_id
 WHERE i.ts >= {start_ts:DateTime64(3)}
   AND i.ts <  now() - INTERVAL {cutoff_hours:UInt8} HOUR
   AND i.feature_version = {feature_version:UInt16}
   AND length(i.features) = {n_features:UInt16}
 ORDER BY i.ts ASC
 """
+# WHY THE JOIN LOOKS LIKE THIS
+#
+# The obvious formulation puts the attribution window in the ON clause:
+#
+#     LEFT JOIN ad_clicks AS c
+#       ON i.impression_id = c.impression_id
+#       AND c.ts >= i.ts AND c.ts <= i.ts + INTERVAL 1 HOUR
+#
+# ClickHouse rejects that outright:
+#
+#     Code: 403. INVALID_JOIN_ON_EXPRESSION: join expression contains column
+#     from left and right table
+#
+# It only supports equality conditions in ON. An inequality spanning both sides
+# needs SET allow_experimental_join_condition = 1, which is not something to
+# depend on in a nightly training job.
+#
+# So: join on impression_id alone, and apply the time window in the projection.
+# Semantics are identical because the subquery collapses ad_clicks to one row
+# per impression_id first.
+#
+# min(ts), not any(ts): /v1/click is idempotent per impression, but a retry or a
+# replayed request can still land a second row. The FIRST click is the one that
+# matters for attribution, and min() makes that deterministic rather than
+# whichever row the engine happened to reach first.
+#
+# NO NULL CHECK, DELIBERATELY. ClickHouse LEFT JOIN fills unmatched rows with
+# the column's DEFAULT (1970-01-01 for DateTime64), not NULL, unless
+# join_use_nulls=1. 1970 is always < i.ts, so an unmatched impression fails the
+# window test and labels 0. Verified for all three cases: no click -> 0, click
+# inside the window -> 1, click after the window -> 0.
  
  
 def load_from_clickhouse(days: int, dsn: str) -> dict[str, np.ndarray]:

@@ -175,6 +175,7 @@ services:
       BOOTSTRAP_API_KEY: ${BOOTSTRAP_API_KEY:-}
       BOOTSTRAP_PUBLISHER_ID: ${BOOTSTRAP_PUBLISHER_ID:-pub_demo}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      BID_RATE_LIMIT: ${BID_RATE_LIMIT:-120/minute}
     depends_on:
       postgres:
         condition: service_healthy
