@@ -27,6 +27,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY adplatform/ ./adplatform/
 COPY scripts/ ./scripts/
 COPY sql/ ./sql/
+# Demo publisher page + ad tag. Dev-only: gateway.py mounts /static and /demo
+# solely when ENV != production, so shipping these costs a few KB and nothing
+# else. In production the tag belongs on a CDN, not on the bid endpoint.
+COPY static/ ./static/
 
 # models/ is a bind mount in compose; this just guarantees the path exists so
 # ctr_model.load() finds an absent directory rather than a missing parent.

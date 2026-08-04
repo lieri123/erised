@@ -18,11 +18,15 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from datetime import date, datetime, timezone
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import (
+    FileResponse, JSONResponse, RedirectResponse, Response,
+)
 from pydantic import BaseModel, Field, field_validator, model_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -227,6 +231,33 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(DynamicCORSMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# Demo publisher page and ad tag — DEVELOPMENT ONLY
+#
+# Mounted only when ENV != production. In production the ad tag belongs on a
+# CDN, not on the bid endpoint: it is a static asset requested on every page
+# view by every visitor of every publisher, and serving it from here puts that
+# traffic on the same process that has to answer auctions in 20ms.
+#
+# Serving the demo page from the gateway's own origin is deliberate. adtag.js
+# calls /v1/bid cross-origin, and DynamicCORSMiddleware only echoes CORS headers
+# back to registered publisher domains; localhost:8000 is in DEV_ORIGINS, so the
+# demo works without registering a fake publisher domain first.
+# ---------------------------------------------------------------------------
+if not settings.is_production:
+    _static = Path(__file__).resolve().parent.parent / "static"
+    if _static.is_dir():
+        app.mount("/static", StaticFiles(directory=str(_static)), name="static")
+
+        @app.get("/demo", include_in_schema=False)
+        async def demo_page():
+            return FileResponse(_static / "demo.html")
+
+        log.info("dev: demo publisher page at /demo, ad tag at /static/adtag.js")
+    else:
+        log.warning("static/ not found — /demo unavailable")
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Daily Standard — demo publisher</title>
+
+<!--
+  Read by adtag.js and passed to the auction as page_keywords, where they drive
+  keyword_overlap and overlap_ratio in the feature vector. Editing these changes
+  which ads win — the quickest way to see targeting work.
+-->
+<meta name="keywords" content="python, cloud, devops, kubernetes">
+
+<style>
+  :root { --ink:#111827; --muted:#6b7280; --line:#e5e7eb; --bg:#fff; }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.65 ui-serif, Georgia, "Times New Roman", serif;
+  }
+  header {
+    border-bottom:2px solid var(--ink); padding:18px 24px;
+    display:flex; align-items:baseline; gap:16px;
+  }
+  .masthead { font-weight:700; font-size:22px; letter-spacing:-.02em; }
+  .tagline { color:var(--muted); font-size:13px; font-family:system-ui,sans-serif; }
+  .wrap {
+    max-width:1100px; margin:0 auto; padding:32px 24px;
+    display:grid; grid-template-columns:minmax(0,1fr) 300px; gap:48px;
+  }
+  article h1 { font-size:34px; line-height:1.2; margin:0 0 8px; letter-spacing:-.02em; }
+  .byline {
+    color:var(--muted); font-family:system-ui,sans-serif; font-size:13px;
+    margin-bottom:24px; padding-bottom:16px; border-bottom:1px solid var(--line);
+  }
+  article p { margin:0 0 18px; }
+
+  /* Ad slots keep their size whether or not they fill, so a no-fill does not
+     reflow the article. This is the single most important thing an ad
+     container does. */
+  .slot {
+    border:1px solid var(--line); background:#fafafa;
+    display:block; overflow:hidden;
+  }
+  .slot--sidebar { width:300px; height:250px; }
+  .slot--inline  { width:100%;  height:110px; margin:28px 0; }
+  .slot-label {
+    font:10px/1 system-ui,sans-serif; text-transform:uppercase;
+    letter-spacing:.08em; color:var(--muted); margin-bottom:6px;
+  }
+  aside { position:sticky; top:32px; align-self:start; }
+
+  .panel {
+    margin-top:24px; padding:14px; border:1px solid var(--line);
+    background:#f9fafb; font:12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .panel h3 { margin:0 0 8px; font:600 11px/1 system-ui,sans-serif;
+              text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
+  .panel button {
+    font:12px system-ui,sans-serif; padding:6px 10px; margin-top:10px;
+    border:1px solid var(--ink); background:var(--ink); color:#fff; cursor:pointer;
+  }
+  .panel input {
+    width:100%; font:11px ui-monospace,monospace; padding:6px;
+    border:1px solid var(--line); margin-top:4px;
+  }
+  .warn { color:#b45309; }
+  @media (max-width:820px) { .wrap { grid-template-columns:1fr; } aside { position:static; } }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="masthead">The Daily Standard</span>
+  <span class="tagline">a fictional publisher, for testing the ad stack</span>
+</header>
+
+<div class="wrap">
+  <main>
+    <article>
+      <h1>Container orchestration in the age of the very large cluster</h1>
+      <div class="byline">By A. Reporter · Technology</div>
+
+      <p>Operators running clusters past a few thousand nodes describe the same
+      pattern: the scheduler stops being the bottleneck and the control plane's
+      write path takes over. What used to be a capacity question becomes a
+      consistency question.</p>
+
+      <p>The workarounds are familiar to anyone who has run a large database.
+      Shard the control plane, relax read consistency where the workload
+      tolerates it, and accept that some operations will be eventually
+      consistent whether or not that is written down anywhere.</p>
+
+      <div class="slot-label">Advertisement</div>
+      <div class="slot slot--inline"
+           data-adplatform-slot
+           data-publisher="pub_demo"
+           data-placement="plc_inline"
+           data-key="REPLACE_WITH_YOUR_KEY"></div>
+
+      <p>None of this is new. What is new is how many organisations now operate
+      at a scale where it matters, and how little of the tooling assumes it.</p>
+
+      <p>The uncomfortable conclusion is that most teams reach for orchestration
+      long before they reach the scale that justifies it, and pay the operational
+      cost the whole way.</p>
+    </article>
+  </main>
+
+  <aside>
+    <div class="slot-label">Advertisement</div>
+    <div class="slot slot--sidebar"
+         data-adplatform-slot
+         data-publisher="pub_demo"
+         data-placement="plc_sidebar"
+         data-key="REPLACE_WITH_YOUR_KEY"></div>
+
+    <div class="panel">
+      <h3>Demo controls</h3>
+      <label>Publisher API key
+        <input id="key" placeholder="pk_test_..." autocomplete="off">
+      </label>
+      <button id="refill">Request new ads</button>
+      <div id="status" style="margin-top:10px;color:#6b7280"></div>
+    </div>
+
+    <div class="panel">
+      <h3>What to look for</h3>
+      Each slot runs its own auction, so the two can show different
+      advertisers. Refill repeatedly and the winner changes — partly because
+      the CTR model scores each request separately, partly because roughly 8%
+      of auctions are handed to a random eligible ad on purpose
+      (EXPLORATION_EPSILON) to keep collecting data on ads the model has
+      already written off.
+      <br><br>
+      Edit the <code>keywords</code> meta tag and refill to watch targeting
+      move.
+      <br><br>
+      <span class="warn">The key sits in the page source. A browser tag cannot
+      hold a secret — see the header of adtag.js.</span>
+    </div>
+  </aside>
+</div>
+
+<script>
+  // Convenience only: lets you paste a key without editing the file. A real
+  // publisher hardcodes theirs in the template.
+  (function () {
+    var input  = document.getElementById("key");
+    var status = document.getElementById("status");
+    var saved  = sessionStorage.getItem("_adp_demo_key");
+    if (saved) input.value = saved;
+
+    function apply() {
+      var k = input.value.trim();
+      if (!k) { status.textContent = "paste a publisher key first"; return; }
+      sessionStorage.setItem("_adp_demo_key", k);
+      var slots = document.querySelectorAll("[data-adplatform-slot]");
+      for (var i = 0; i < slots.length; i++) slots[i].setAttribute("data-key", k);
+      status.textContent = "requesting…";
+      window.adplatform.refresh();
+      setTimeout(function () {
+        var filled = document.querySelectorAll('[data-adplatform-state="filled"]').length;
+        status.textContent = filled + " of " + slots.length + " slots filled";
+      }, 700);
+    }
+
+    document.getElementById("refill").addEventListener("click", apply);
+    input.addEventListener("keydown", function (e) { if (e.key === "Enter") apply(); });
+    if (saved) apply();
+  })();
+</script>
+
+<script src="/static/adtag.js" async></script>
+</body>
+</html>
