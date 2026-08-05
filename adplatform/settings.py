@@ -72,8 +72,23 @@ def _bool(key: str, default: bool) -> bool:
 
 
 def _csv(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """
+    Comma-separated list from the environment.
+
+    UNSET and EMPTY ARE DIFFERENT, deliberately. `os.getenv(key) is None` means
+    nobody configured this, so use the default; an explicitly empty string means
+    somebody configured it to nothing, so honour that.
+
+    The obvious `if not raw: return default` conflates the two, and for
+    DEV_ORIGINS that is a security bug rather than a style nit: cors.py
+    documents `DEV_ORIGINS=""` as the way to drop localhost in production, but
+    an empty string is falsy, so the default came back and every localhost
+    origin stayed CORS-allowed. No error, no warning — you follow the
+    instruction and get the opposite of what it promises. (`DEV_ORIGINS=" "`
+    happened to work, because a space is truthy and then gets stripped.)
+    """
     raw = os.getenv(key)
-    if not raw:
+    if raw is None:
         return default
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 

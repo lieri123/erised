@@ -51,7 +51,19 @@ from .auth import (
     add_key_now,
     should_write_last_used,
 )
-from .cors import DynamicCORSMiddleware, load_origins_from_db, refresh_origins_loop
+# add_origin is used by POST /admin/publishers to register the new publisher's
+# domain for CORS in-process, so their very first browser request works instead
+# of failing for up to cors_refresh_interval while they conclude the
+# integration is broken. It was missing from this import, so that endpoint
+# raised NameError and returned 500 on every call — after the publisher row and
+# API key had already been written, leaving a publisher that exists but cannot
+# be reached from a browser.
+from .cors import (
+    DynamicCORSMiddleware,
+    add_origin,
+    load_origins_from_db,
+    refresh_origins_loop,
+)
 from .db import (
     get_impression,
     get_publisher_stats,
