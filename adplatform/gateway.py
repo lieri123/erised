@@ -231,6 +231,7 @@ async def lifespan(app: FastAPI):
         await close_kafka()
         if app.state.redis is not None:
             await app.state.redis.aclose()
+        await db.close_db()
 
 
 app = FastAPI(
