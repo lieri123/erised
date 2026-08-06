@@ -1,17 +1,4 @@
 # settings.py — every piece of environment-dependent configuration, in one place.
-#
-# Why a module and not os.getenv() scattered around:
-#   The same code has to run in three environments — your laptop (localhost),
-#   docker compose (service hostnames), and the Hetzner box (real hosts). Each
-#   hardcoded "localhost:8123" is a place that silently connects to nothing in
-#   two of those three.
-#
-# Read once at import, frozen afterwards. Nothing here should ever be mutated at
-# runtime; if you need a value to change while running, it belongs in the
-# database with a refresh loop, not here.
-#
-# Precedence: real environment variable > .env file > default below.
-
 from __future__ import annotations
 
 import os
@@ -74,18 +61,6 @@ def _bool(key: str, default: bool) -> bool:
 def _csv(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
     """
     Comma-separated list from the environment.
-
-    UNSET and EMPTY ARE DIFFERENT, deliberately. `os.getenv(key) is None` means
-    nobody configured this, so use the default; an explicitly empty string means
-    somebody configured it to nothing, so honour that.
-
-    The obvious `if not raw: return default` conflates the two, and for
-    DEV_ORIGINS that is a security bug rather than a style nit: cors.py
-    documents `DEV_ORIGINS=""` as the way to drop localhost in production, but
-    an empty string is falsy, so the default came back and every localhost
-    origin stayed CORS-allowed. No error, no warning — you follow the
-    instruction and get the opposite of what it promises. (`DEV_ORIGINS=" "`
-    happened to work, because a space is truthy and then gets stripped.)
     """
     raw = os.getenv(key)
     if raw is None:
@@ -95,26 +70,13 @@ def _csv(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class Settings:
-    # -- service identity ---------------------------------------------------
     env: str = field(default_factory=lambda: _str("ENV", "development"))
     log_level: str = field(default_factory=lambda: _str("LOG_LEVEL", "INFO"))
 
-    # The base URL publishers' browsers can reach. This ends up inside every
-    # click URL embedded in a creative, so getting it wrong means every click
-    # in production points at localhost.
     public_base_url: str = field(
         default_factory=lambda: _str("PUBLIC_BASE_URL", "http://localhost:8000")
     )
 
-    # How long a signed click URL stays valid. This is a genuine trade-off, not
-    # a tuning knob to max out:
-    #
-    #   too short — a user opens an article in a background tab, clicks twenty
-    #     minutes later, and gets a 403 instead of the advertiser's page. The
-    #     advertiser paid for that impression and lost the visit.
-    #   too long — a scraped click URL stays forgeable for that whole window.
-    #
-    # 24h is the industry norm and matches a typical click-attribution window.
     click_url_ttl_seconds: int = field(
         default_factory=lambda: _int("CLICK_URL_TTL_SECONDS", 60 * 60 * 24)
     )
@@ -180,26 +142,18 @@ class Settings:
     )
 
     # -- auth / admin ---------------------------------------------------------
-    # HMAC pepper for api_key hashing (auth.hash_api_key). The insecure default
-    # below is caught by validate_for_production() — it must never be the real
-    # value once ENV=production, since anyone who read this repo knows it.
+   
     api_key_pepper: str = field(
         default_factory=lambda: _str("API_KEY_PEPPER", "dev-only-insecure-pepper")
     )
     api_key_refresh_seconds: int = field(
         default_factory=lambda: _int("API_KEY_REFRESH_SECONDS", 60)
     )
-    # How often should_write_last_used() lets a key's last_used_at actually hit
-    # Postgres. See the comment block at the bottom of auth.py.
     last_used_write_interval: int = field(
         default_factory=lambda: _int("LAST_USED_WRITE_INTERVAL", 300)
     )
-    # Shared static token guarding /admin/*. Empty means the admin API is
-    # disabled (require_admin returns 503) rather than open.
     admin_token: str = field(default_factory=lambda: _str("ADMIN_TOKEN", ""))
-    # Lets a fresh install authenticate its first request before any publisher
-    # row exists. auth._bootstrap_keys() refuses to activate this in production
-    # regardless of what it is set to.
+
     bootstrap_api_key: str = field(default_factory=lambda: _str("BOOTSTRAP_API_KEY", ""))
     bootstrap_publisher_id: str = field(
         default_factory=lambda: _str("BOOTSTRAP_PUBLISHER_ID", "pub_demo")
@@ -223,8 +177,6 @@ class Settings:
     )
 
     # -- auction ------------------------------------------------------------
-    # Not zero. See the note in ml/rtb_integration.py — this is what keeps the
-    # training data from being a closed loop on the model's own past opinions.
     exploration_epsilon: float = field(
         default_factory=lambda: _float("EXPLORATION_EPSILON", 0.08)
     )
@@ -304,8 +256,4 @@ def get_settings() -> Settings:
     return Settings()
 
 
-# Module-level convenience. Import this, not the individual values —
-# `from .settings import settings` keeps one object; `from .settings import
-# database_url` would snapshot a string and reintroduce exactly the stale-binding
-# problem that bit db._pool.
 settings = get_settings()
