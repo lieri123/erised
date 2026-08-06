@@ -1,12 +1,4 @@
 # db.py — Postgres persistence via asyncpg.
-#
-# Division of labour between the three stores:
-#   Postgres    — one row by key, transactional. Powers the click lookup.
-#   ClickHouse  — scan-and-aggregate over everything. Powers training + reporting.
-#   Redis       — hot counters. Powers budget enforcement.
-#
-# This file is the Postgres half. It deliberately does NOT store the feature
-# vector; that goes to ClickHouse via Kafka.
 
 from __future__ import annotations
 
@@ -20,8 +12,6 @@ from .settings import settings
 
 log = logging.getLogger("db")
 
-# Module-level. gateway.py reads this as `db._pool`, NOT via
-# `from db import _pool` — that would bind a snapshot of None at import time.
 _pool: Optional[asyncpg.Pool] = None
 
 
@@ -95,10 +85,6 @@ async def init_db() -> Optional[asyncpg.Pool]:
     """
     Create the pool and ensure the schema exists. Returns the pool, and also
     sets the module-level `_pool`.
-
-    Does NOT raise if Postgres is unreachable — the gateway logs a warning and
-    runs with CORS restricted to dev origins. Failing to boot because the
-    database is briefly down is worse than booting degraded.
     """
     global _pool
     try:
@@ -126,17 +112,12 @@ async def close_db() -> None:
         _pool = None
 
 
-# ---------------------------------------------------------------------------
 # Impressions
-# ---------------------------------------------------------------------------
 
 async def save_impression(record: dict[str, Any]) -> None:
     """
     Insert one impression. Called via spawn() so it never blocks the bid
     response.
-
-    ON CONFLICT DO NOTHING because retries and duplicate events are cheaper to
-    absorb than to prevent, and impression_id is already unique per auction.
     """
     if _pool is None:
         return
@@ -199,13 +180,6 @@ async def mark_clicked(impression_id: str) -> bool:
     """
     Mark an impression clicked. Returns True only if THIS call was the one that
     flipped the flag.
-
-    The `AND clicked = FALSE` in the WHERE clause plus RETURNING makes the
-    check-and-set atomic in a single statement. Reading `clicked` first and
-    then updating — which is what the gateway used to do — lets two concurrent
-    clicks on the same impression both see FALSE and both emit a click event.
-    A double-counted click is a corrupted training label, and it inflates the
-    measured CTR of whichever ad got double-clicked.
     """
     if _pool is None:
         return False
@@ -226,9 +200,7 @@ async def mark_clicked(impression_id: str) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
 # Conversions
-# ---------------------------------------------------------------------------
 
 async def save_conversion(event: dict[str, Any]) -> None:
     if _pool is None:
@@ -258,20 +230,13 @@ async def save_conversion(event: dict[str, Any]) -> None:
         log.exception("save_conversion failed for %s", event.get("impression_id"))
 
 
-# ---------------------------------------------------------------------------
 # Reporting
-# ---------------------------------------------------------------------------
 
 async def get_publisher_stats(publisher_id: str) -> dict[str, Any]:
     """
     Last 30 days for one publisher.
 
-    Postgres is the wrong engine for this once you have real volume — it is a
-    full scan of every impression row. Move it to ClickHouse when the query
-    starts taking seconds. Fine for now.
-
-    revenue_usd sums cost_usd, not win_price. win_price is a CPM; summing it
-    would report roughly 1000x actual revenue.
+    Use clickhouse in future
     """
     empty = {
         "publisher_id": publisher_id, "impressions": 0, "clicks": 0,
@@ -311,8 +276,8 @@ async def get_publisher_stats(publisher_id: str) -> dict[str, Any]:
 
 async def get_advertiser_stats(advertiser_id: str) -> dict[str, Any]:
     """
-    Last 30 days for one advertiser. Mirrors get_publisher_stats — same
-    caveat about Postgres being the wrong engine once volume is real.
+    Last 30 days for one advertiser. Mirrors get_publisher_stats 
+    use clickhouse in future
     """
     empty = {
         "advertiser_id": advertiser_id, "impressions": 0, "clicks": 0,
@@ -350,9 +315,7 @@ async def get_advertiser_stats(advertiser_id: str) -> dict[str, Any]:
         return empty
 
 
-# ---------------------------------------------------------------------------
 # Campaigns / ads
-# ---------------------------------------------------------------------------
 
 async def create_campaign(fields: dict[str, Any]) -> Optional[str]:
     """Returns the campaign_id on success, None if Postgres is unavailable or the insert fails."""
@@ -445,11 +408,6 @@ async def set_status(
 
     `table` and `id_col` come from the call sites in gateway.py, never from the
     request, so this is not a SQL-injection surface despite the f-string.
-
-    Ownership is checked in the same statement rather than as a prior SELECT:
-    for `ads`, ownership is via the parent campaign, so the WHERE clause
-    differs per table and doing it as one UPDATE...RETURNING avoids a
-    check-then-act race with a concurrent status change.
     """
     if _pool is None:
         return False
@@ -484,9 +442,7 @@ async def set_status(
         return False
 
 
-# ---------------------------------------------------------------------------
 # Publishers / advertisers / api keys (admin provisioning)
-# ---------------------------------------------------------------------------
 
 async def create_publisher(publisher_id: str, domain: str, name: Optional[str]) -> bool:
     if _pool is None:
@@ -587,27 +543,7 @@ async def list_api_keys(publisher_id: str) -> list[dict[str, Any]]:
         return []
 
 
-async def touch_api_key(key_id: str) -> None:
-    """
-    Stamp last_used_at. Called from gateway.note_key_usage via spawn(), already
-    throttled by auth.should_write_last_used to one write per key per
-    last_used_write_interval (default 300s).
-
-    That throttle is why this can be a plain UPDATE with no upsert or contention
-    handling: at most one write per key per five minutes, and a lost race just
-    means the timestamp is a few minutes stale. last_used_at is an operational
-    breadcrumb for "is this key still in use before I revoke it", not an audit
-    log — do not build billing or security decisions on it.
-
-    Swallows its own exceptions like every other spawn() target here. A failed
-    timestamp write must never surface as a failed bid.
-
-    NOTE: gateway.py:307 called this function before it existed, which raised
-    AttributeError while evaluating the argument to spawn() — i.e. on the
-    caller's stack, before the task was ever created, so the fire-and-forget
-    error isolation did not apply. Every authenticated endpoint returned 500;
-    only /health worked, because it does not authenticate.
-    """
+async def touch_api_key(key_id: str) -> None:   
     if _pool is None:
         return
     try:
