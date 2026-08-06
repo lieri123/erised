@@ -1,18 +1,4 @@
 # features.py — the ONLY place features are computed.
-#
-# Both the serving path (rtb.score_ads) and the training path (train_ctr.py)
-# import extract_features() from here. That is not a style preference — it is
-# the mechanism that prevents train/serve skew. If you ever find yourself
-# writing feature logic anywhere else, that is a bug.
-#
-# When you change the feature set:
-#   1. Bump FEATURE_VERSION
-#   2. Deploy the new serving code (starts logging v+1 rows)
-#   3. Wait until you have enough v+1 rows to train on
-#   4. Train a v+1 model
-# CtrModel refuses to load an artifact whose feature_version != FEATURE_VERSION,
-# so a half-finished migration fails loudly at startup instead of silently
-# feeding the model garbage.
  
 from __future__ import annotations
  
@@ -21,9 +7,6 @@ from datetime import datetime, timezone
  
 FEATURE_VERSION = 2
  
-# Order is load-bearing. XGBoost consumes a positional array; if you reorder
-# this list without bumping the version, every existing model becomes wrong
-# while still returning confident-looking numbers.
 FEATURE_NAMES: tuple[str, ...] = (
     "hour_of_day",            # 0-23
     "day_of_week",            # 0=Mon
@@ -54,7 +37,7 @@ class RequestContext:
  
     publisher_id: str
     placement_id: str
-    device_type: str            # "mobile" | "desktop" | "tablet" | other
+    device_type: str            
     page_keywords: tuple[str, ...]
     request_ts: datetime
  
@@ -68,7 +51,6 @@ class RequestContext:
         request_ts: datetime | None = None,
     ) -> "RequestContext":
         ts = request_ts or datetime.now(timezone.utc)
-        # Normalise keywords once, here, rather than in each feature.
         kws = tuple(sorted({k.strip().lower() for k in page_keywords if k.strip()}))
         return cls(
             publisher_id=publisher_id,
@@ -81,15 +63,6 @@ class RequestContext:
  
 @dataclass
 class CtrStats:
-    """
-    Historical CTR aggregates, refreshed periodically from ClickHouse into
-    process memory. Read-only on the hot path — no I/O during scoring.
- 
-    Beta-smoothed so a 1-impression-1-click ad does not get a 100% prior.
-    prior_strength is the number of pseudo-impressions the global average is
-    worth; 200 is a reasonable start for low-volume inventory.
-    """
- 
     global_ctr: float = 0.010
     prior_strength: float = 200.0
     # key -> (impressions, clicks)
@@ -122,22 +95,10 @@ class CtrStats:
         return not self.ad_counts and not self.placement_counts
  
  
-# Module-level default so scoring works before any stats have loaded.
 EMPTY_STATS = CtrStats()
  
  
 def extract_features(ad, ctx: RequestContext, stats: CtrStats = EMPTY_STATS) -> list[float]:
-    """
-    Build the feature vector for one (ad, request) pair.
- 
-    `ad` is duck-typed rather than imported from rtb.py — the training job runs
-    offline with rows reconstructed from ClickHouse, not with live Ad objects,
-    and importing rtb.py there would drag in asyncpg, Kafka clients, and the
-    rest of the serving stack. Anything with the attributes below works.
- 
-    Returns a plain list[float] of length N_FEATURES, in FEATURE_NAMES order.
-    This exact list is what gets logged alongside the impression.
-    """
     ts = ctx.request_ts
     hour = float(ts.hour)
     dow = float(ts.weekday())

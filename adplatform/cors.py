@@ -119,21 +119,6 @@ async def add_origin(pool, domain: str):
     REGISTERED_ORIGINS.add(domain)
     log.info(f"CORS origin added immediately: {domain}")
 
-
-async def remove_origin(domain: str):
-    """
-    Remove a single origin immediately — e.g. when a publisher is suspended.
-    Their tag stops working in the browser right away without waiting for a refresh.
-    """
-    REGISTERED_ORIGINS.discard(domain)
-    log.info(f"CORS origin removed immediately: {domain}")
-
-
-def is_registered(origin: str) -> bool:
-    """Check if an origin is currently registered. Used in tests and admin tooling."""
-    return origin in REGISTERED_ORIGINS
-
-
 # ---------------------------------------------------------------------------
 # Background refresh loop
 # ---------------------------------------------------------------------------

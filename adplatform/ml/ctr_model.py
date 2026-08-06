@@ -1,12 +1,4 @@
 # ctr_model.py — model loading and inference for the serving path.
-#
-# Design goals, in priority order:
-#   1. Never raise on the hot path. A broken model must degrade to the baseline,
-#      not 500 the bid request.
-#   2. Never block. Loading happens in a background task; predict() only reads
-#      already-resident objects.
-#   3. Never silently mismatch. A model trained on a different feature version
-#      is refused at load time.
 
 from __future__ import annotations
 
@@ -30,26 +22,11 @@ from .features import (
 
 log = logging.getLogger(__name__)
 
-# Hard clamps. A model that predicts 0.0 makes bid_value 0 and the ad can never
-# win again — a self-reinforcing dead zone. A model that predicts 0.9 on a
-# 1% inventory will drain an advertiser's daily budget in minutes.
 MIN_CTR = 0.0001
 MAX_CTR = 0.25
 
 
 def _undo_negative_downsampling(p: np.ndarray, keep_rate: float) -> np.ndarray:
-    """
-    A model trained on negatives downsampled at `keep_rate` predicts inflated
-    probabilities. Recover the true scale.
-
-    Downsampling negatives by w multiplies the odds by 1/w, so:
-        odds_true = w * odds_sampled
-        p_true    = w*p' / (w*p' + 1 - p')
-
-    Skipping this step is the single most expensive bug available to you here:
-    the model still ranks correctly, so offline AUC looks great, and you
-    overbid on every impression in production.
-    """
     if keep_rate >= 1.0:
         return p
     p = np.clip(p, 1e-9, 1 - 1e-9)
@@ -65,11 +42,6 @@ class _Artifact:
 
 
 class CtrModel:
-    """
-    Thread-safe holder for the current model. Swap-on-reload via a single
-    reference assignment, which is atomic under the GIL — no lock needed on the
-    read path.
-    """
 
     def __init__(self, artifact_dir: str | Path | None = None):
         self.artifact_dir = Path(artifact_dir or settings.model_dir)
@@ -161,16 +133,12 @@ class CtrModel:
 
         Returns (ctrs, feature_vectors). The feature vectors come back so the
         caller can log the winner's exact input — do not recompute them.
-
-        One batched call, not one call per ad: XGBoost's per-call overhead
-        dominates for small inputs, so scoring 40 ads individually can cost
-        20x a single batched predict.
         """
         vectors = [extract_features(ad, ctx, stats) for ad in ads]
         if not vectors:
             return [], []
 
-        artifact = self._artifact  # single read; may be swapped concurrently
+        artifact = self._artifact 
 
         if artifact is None:
             return [
@@ -195,19 +163,9 @@ class CtrModel:
             return [self._baseline_ctr(ad, ctx, stats) for ad in ads], vectors
 
     def _baseline_ctr(self, ad, ctx: RequestContext, stats: CtrStats) -> float:
-        """
-        Phase-1 baseline: beta-smoothed historical CTR for the (ad, placement)
-        pair, nudged by keyword overlap so cold-start ads are not all identical.
-
-        Do not dismiss this as a placeholder. It is also your promotion gate —
-        train_ctr.py refuses to ship a model that cannot beat it on held-out
-        log loss, which is the check that catches most training bugs.
-        """
         base = stats.pair_ctr(ad.ad_id, ctx.placement_id)
         ad_kws = {k.lower() for k in (ad.target_keywords or ())}
         overlap = len(ad_kws & set(ctx.page_keywords))
-        # Multiplicative so the adjustment scales with the ad's own history
-        # rather than swamping it.
         boost = 1.0 + min(0.6, 0.15 * overlap)
         return float(np.clip(base * boost, MIN_CTR, MAX_CTR))
 
