@@ -1,46 +1,4 @@
 # signing.py — HMAC signatures for click URLs.
-#
-# THE PROBLEM
-# -----------
-# /v1/click took only an impression_id. Anyone who saw one click URL could
-# replay it, and — because impression_ids appear in ad_markup that we hand to
-# every publisher page — that is not a hypothetical. Each accepted click is a
-# training label. Forged clicks therefore:
-#
-#   1. inflate the measured CTR of whichever ad the attacker likes,
-#   2. teach the CTR model that ad is good, so it wins more auctions,
-#   3. and, once conversions are billed, cost the advertiser real money.
-#
-# mark_clicked's atomic check-and-set already stops the SAME id being counted
-# twice, so the loss is bounded at one forged click per impression_id observed.
-# That is still enough to poison a model: an attacker who scrapes ids across a
-# publisher's inventory can click every one of them.
-#
-# WHAT THIS DOES AND DOES NOT SOLVE
-# ---------------------------------
-# Signing proves a click URL was MINTED BY US and has not been tampered with or
-# replayed after expiry. It does not prove a human clicked it. A bot that loads
-# the page, receives a legitimately signed URL and fetches it is indistinguishable
-# from a user here — that is invalid-traffic detection, a much harder problem,
-# and it is not solved in this file. Do not read a valid signature as "real
-# click"; read it as "this URL came from us, recently".
-#
-# DESIGN NOTES
-# ------------
-# * The signature covers impression_id AND expiry together. Signing only the id
-#   would let an attacker extend the window by editing the expiry.
-# * Truncated to 16 bytes / 22 base64url chars. A full SHA-256 is 43 chars and
-#   the URL is embedded in every creative; 128 bits is far beyond what a
-#   forger can brute-force against a server that logs failures.
-# * compare_digest, not ==. String comparison short-circuits on first mismatch,
-#   which leaks how many leading bytes were right and turns forgery into a
-#   byte-at-a-time search.
-# * Reuses settings.api_key_pepper as the key. One secret to manage, and its
-#   rotation semantics are already understood: rotating invalidates outstanding
-#   signatures, which self-heals within click_url_ttl_seconds. That is a
-#   deliberate trade — a separate CLICK_SIGNING_KEY would be cleaner but adds a
-#   secret nobody remembers to set, and an unset secret is worse than a shared
-#   one.
 
 from __future__ import annotations
 
@@ -68,8 +26,6 @@ def _b64(raw: bytes) -> str:
 
 
 def _compute(impression_id: str, expires_at: int) -> str:
-    # The separator matters. Without it, ("ab", 1) and ("a", 21) produce the
-    # same signed message, so a signature for one validates the other.
     message = f"{impression_id}:{expires_at}".encode()
     digest = hmac.new(
         settings.api_key_pepper.encode(), message, hashlib.sha256
@@ -95,14 +51,10 @@ def verify_click(impression_id: str, expires_at: int, signature: str) -> None:
     """Returns None if valid, raises ClickSignatureError otherwise."""
     now = int(time.time())
 
-    # Expiry first: it is the cheap check, and a stale-but-authentic URL is the
-    # common case (a user opens a tab and clicks an hour later), not an attack.
     if now > expires_at:
         raise ClickSignatureError(f"expired {now - expires_at}s ago")
 
-    # An expiry far in the future is a tampering attempt, and rejecting it
-    # bounds the damage if the pepper ever leaks. Allow a little slack for
-    # clock skew between whichever gateway signed and whichever verifies.
+    
     max_future = now + settings.click_url_ttl_seconds + 300
     if expires_at > max_future:
         raise ClickSignatureError("expiry too far in the future")
