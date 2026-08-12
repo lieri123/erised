@@ -1,36 +1,5 @@
 # migrate_budget_keys.py — carry today's spend from the old per-ad Redis keys
 # to the new per-campaign keys.
-#
-#     python -m scripts.migrate_budget_keys --dry-run
-#     python -m scripts.migrate_budget_keys
-#
-# WHY THIS EXISTS
-# ---------------
-# budget.py used to key spend on ad_id ("budget:<ad_id>:<day>") and now keys on
-# campaign_id ("budget:camp:<campaign_id>:<day>"). Different namespace, so on
-# deploy every campaign reads 0 spent and gets a SECOND full daily budget for
-# whatever remains of the day. On a $500 campaign that is a $500 mistake, and
-# it happens once per campaign, silently.
-#
-# reconcile() would eventually fix it -- but only for impressions that carry a
-# campaign_id, which means only those served after migration 003. Everything
-# from earlier today has campaign_id = '' and is excluded from the reconcile
-# query by design. So the gap is real and this script closes it.
-#
-# WHEN YOU CAN SKIP IT
-# --------------------
-# Deploy just after 00:00 UTC and there is nothing to carry over: both
-# namespaces are empty for the new day. That is the cleaner option if you can
-# choose your deploy window.
-#
-# ORDER
-# -----
-#   1. apply sql/003_campaign_budgets.sql
-#   2. deploy the new gateway
-#   3. run this
-#
-# Running it BEFORE the deploy is harmless but pointless -- the old gateway keeps
-# writing ad keys, so the campaign totals go stale immediately.
 
 from __future__ import annotations
 
@@ -66,18 +35,13 @@ async def main() -> int:
     pg = await asyncpg.connect(settings.database_url, timeout=10)
 
     try:
-        # ad_id -> campaign_id for every ad we know about. Ads deleted since
-        # they last served are simply absent, and their spend is unattributable.
+       
         mapping = {
             row["ad_id"]: row["campaign_id"]
             for row in await pg.fetch("SELECT ad_id, campaign_id FROM ads")
         }
 
-        # SCAN, not KEYS. KEYS blocks the server for the length of the scan, and
-        # this runs against the same Redis the auction reads from.
-        #
-        # The pattern must exclude the new namespace: "budget:*" would match
-        # "budget:camp:..." too and we would sum the new keys into themselves.
+        
         totals: dict[str, float] = defaultdict(float)
         unmapped: list[str] = []
         old_keys: list[str] = []
@@ -85,8 +49,7 @@ async def main() -> int:
         async for key in r.scan_iter(match=f"budget:*:{day}", count=500):
             if key.startswith("budget:camp:"):
                 continue
-            # budget:<ad_id>:<day> -- ad_id may itself contain colons, so strip
-            # the known prefix and suffix rather than splitting.
+           
             ad_id = key[len("budget:"):-(len(day) + 1)]
             raw = await r.get(key)
             if raw is None:
@@ -115,11 +78,7 @@ async def main() -> int:
             existing = await r.get(new_key)
             existing = float(existing) if existing else 0.0
 
-            # MAX, not sum. If the new gateway has already been running, the
-            # campaign key holds real spend from post-deploy impressions -- some
-            # of which may also appear in the ad keys if both code paths ran.
-            # Adding would double-count. Taking the larger keeps the advertiser
-            # protected without inventing spend.
+            
             merged = max(existing, spent)
 
             if args.dry_run:

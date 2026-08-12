@@ -1,8 +1,4 @@
 # refresh.py — background tasks that keep the serving process current.
-#
-# Same pattern as your dynamic CORS refresher: a long-lived task started in the
-# FastAPI lifespan, cancelled on shutdown. Nothing here ever runs inside a
-# request handler.
 
 from __future__ import annotations
 
@@ -28,11 +24,7 @@ WHERE day >= today() - {lookback:UInt16}
 GROUP BY ad_id, placement_id
 """
 
-# Mutable module-level holder. Swapped wholesale on refresh rather than mutated
-# in place, so a request that reads it mid-refresh sees a consistent snapshot
-# instead of half-updated dicts.
 _stats = CtrStats()
-
 
 def current_stats() -> CtrStats:
     return _stats
@@ -58,9 +50,6 @@ async def _load_stats(ch_client) -> CtrStats:
         total_imps += imps
         total_clicks += clicks
 
-    # Global CTR is the prior everything else shrinks toward. Falling back to a
-    # hardcoded 1% on an empty table is deliberate — a global_ctr of 0 would
-    # make every smoothed prior 0, every bid_value 0, and no ad would ever win.
     global_ctr = (total_clicks / total_imps) if total_imps > 1000 else 0.010
 
     return CtrStats(
@@ -81,8 +70,6 @@ async def stats_refresh_loop(ch_client) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            # Keep the previous snapshot. Stale priors are survivable;
-            # crashing the refresher is not.
             log.exception("CTR stats refresh failed, keeping previous snapshot")
         await asyncio.sleep(STATS_REFRESH_SECONDS)
 
@@ -96,27 +83,3 @@ async def model_refresh_loop() -> None:
         except Exception:
             log.exception("model reload check failed")
         await asyncio.sleep(MODEL_REFRESH_SECONDS)
-
-
-# ---------------------------------------------------------------------------
-# Wiring into your existing lifespan
-# ---------------------------------------------------------------------------
-#
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     app.state.ch = clickhouse_connect.get_client(dsn=settings.clickhouse_dsn)
-#
-#     ctr_model.load()                      # synchronous first load, so the
-#                                           # first bid request is not served by
-#                                           # the baseline while the loop waits
-#     tasks = [
-#         asyncio.create_task(stats_refresh_loop(app.state.ch)),
-#         asyncio.create_task(model_refresh_loop()),
-#         asyncio.create_task(cors_refresh_loop(app)),     # you already have this
-#     ]
-#     try:
-#         yield
-#     finally:
-#         for t in tasks:
-#             t.cancel()
-#         await asyncio.gather(*tasks, return_exceptions=True)

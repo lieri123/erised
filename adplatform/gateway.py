@@ -246,19 +246,8 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(DynamicCORSMiddleware)
 
 
-# ---------------------------------------------------------------------------
 # Demo publisher page and ad tag — DEVELOPMENT ONLY
-#
-# Mounted only when ENV != production. In production the ad tag belongs on a
-# CDN, not on the bid endpoint: it is a static asset requested on every page
-# view by every visitor of every publisher, and serving it from here puts that
-# traffic on the same process that has to answer auctions in 20ms.
-#
-# Serving the demo page from the gateway's own origin is deliberate. adtag.js
-# calls /v1/bid cross-origin, and DynamicCORSMiddleware only echoes CORS headers
-# back to registered publisher domains; localhost:8000 is in DEV_ORIGINS, so the
-# demo works without registering a fake publisher domain first.
-# ---------------------------------------------------------------------------
+
 if not settings.is_production:
     _static = Path(__file__).resolve().parent.parent / "static"
     if _static.is_dir():
@@ -273,9 +262,7 @@ if not settings.is_production:
         log.warning("static/ not found — /demo unavailable")
 
 
-# ---------------------------------------------------------------------------
 # Models
-# ---------------------------------------------------------------------------
 
 class BidRequest(BaseModel):
     publisher_id:   str           = Field(..., min_length=1, max_length=64)
@@ -330,22 +317,6 @@ class StatsResponse(BaseModel):
     ctr:          float
     revenue_usd:  float
 
-
-# ---------------------------------------------------------------------------
-# Auth
-#
-# The hardcoded VALID_API_KEYS dict is gone. Keys now live in the api_keys
-# table, hashed with a server pepper, cached in memory and refreshed in the
-# background. See auth.py for why HMAC-SHA256 rather than argon2, and why this
-# fails closed while budget.py fails open.
-#
-# authenticate() is replaced by the require_publisher dependency. The difference
-# matters: FastAPI resolves dependencies BEFORE parsing the request body, so
-# unauthenticated callers no longer get free Pydantic validation of whatever
-# they send. It also puts the scheme in the OpenAPI docs.
-# ---------------------------------------------------------------------------
-
-
 def note_key_usage(publisher: Publisher) -> None:
     """Fire-and-forget last_used_at, throttled to one write per key per window."""
     if publisher.key_id != "bootstrap" and should_write_last_used(publisher.key_id):
@@ -362,10 +333,7 @@ async def log_requests(request: Request, call_next):
     response.headers["X-Latency-Ms"] = str(ms)
     return response
 
-
-# ---------------------------------------------------------------------------
 # POST /v1/bid
-# ---------------------------------------------------------------------------
 
 @app.post("/v1/bid", tags=["Serving"],
           summary="Run a real-time auction and return a winning ad")
@@ -376,15 +344,9 @@ async def bid(
     publisher: Publisher = Depends(require_publisher),
 ):
     t0 = time.perf_counter()
-    # Identity comes from the KEY, never from the body. bid_request.publisher_id
-    # is caller-supplied and is not trusted for anything.
     publisher_id = publisher.publisher_id
     note_key_usage(publisher)
 
-    # A key that says pub_a sending publisher_id=pub_b is either a broken
-    # integration or someone probing for a confused-deputy bug. Neither should
-    # be silently normalised — the publisher needs to know their tag is
-    # misconfigured, and if it is probing you want it in the logs.
     claimed = getattr(bid_request, "publisher_id", None)
     if claimed and claimed != publisher_id:
         log.warning("publisher_id mismatch: key=%s body=%s", publisher_id, claimed)
@@ -393,13 +355,8 @@ async def bid(
             detail="publisher_id does not match the authenticated key",
         )
 
-    # Mint the id ONCE, before the auction. It goes into the click URL, the
-    # Postgres row, and the ClickHouse impression event. Two uuids means the
-    # training join matches nothing and the model never sees a positive.
     impression_id = str(uuid.uuid4())
 
-    # Server time, not bid_request.timestamp_ms. The client clock is
-    # attacker-controlled and hour_of_day is a model feature.
     request_ts = datetime.now(timezone.utc)
 
     result, ctx = await run_rtb(
@@ -441,18 +398,10 @@ async def bid(
         publisher_id, latency_ms,
     )
 
-    # Decrement by cost_usd, NOT win_price. win_price is a CPM; this single
-    # impression costs one thousandth of it. Using win_price here would burn a
-    # $500 daily budget in about 125 impressions.
     if request.app.state.budget is not None:
-        # Charge the CAMPAIGN, not the ad. daily_budget_usd is a campaign
-        # property; keying spend on ad_id gave a three-creative campaign three
-        # independent counters and let it spend 3x its budget.
         spawn(request.app.state.budget.record_spend(winner.ad.campaign_id, result.cost_usd),
               name="record-spend")
 
-    # Postgres row — powers the click lookup. destination_url is what lets
-    # /v1/click drop the redirect query parameter.
     spawn(save_impression({
         **base_event,
         "ad_id":           winner.ad.ad_id,
@@ -466,17 +415,14 @@ async def bid(
         "filled":          True,
     }), name="save-impression")
 
-    # ClickHouse row — carries the feature vector for training. Deliberately
-    # separate from the Postgres write: different shape, lifetime, and consumer.
+  
     spawn(publish_event("impressions", {
         **build_impression_event(result, ctx),
         "user_id":  bid_request.user_id,
         "page_url": bid_request.page_url,
     }), name="impression-event")
 
-    # Signed. An unsigned click URL is a forgeable training label: anyone who
-    # scrapes an impression_id out of a publisher page can manufacture a click
-    # for whichever ad they like. See signing.py.
+    
     ad_markup = winner.ad.creative_html.replace(
         "{{CLICK_URL}}", build_click_url(impression_id))
 
@@ -491,9 +437,7 @@ async def bid(
     return response
 
 
-# ---------------------------------------------------------------------------
 # GET /v1/click
-# ---------------------------------------------------------------------------
 
 @app.get("/v1/click", tags=["Tracking"],
          summary="Record a click then redirect to the advertiser")
@@ -505,27 +449,14 @@ async def track_click(
     """
     No `redirect` parameter. The destination is read from the impression row,
     so there is nothing for an attacker to point elsewhere.
-
-    The old version accepted any http(s) URL as a query parameter and redirected
-    to it even when the impression_id did not exist — a fully open redirect
-    requiring no valid id at all.
-
-    SIGNATURE REQUIRED. exp and sig are minted per impression in build_click_url
-    and verified here. Without them any leaked impression_id could be replayed
-    into a training label — see the header of signing.py for why that matters
-    more than it sounds.
     """
     if exp is None or sig is None:
-        # Almost always an old creative served before signing shipped, or a
-        # hand-built URL. Both look identical to an attack from here.
         log.warning("unsigned click rejected | id=%s", id)
         raise HTTPException(status_code=403, detail="Invalid or expired click URL")
 
     try:
         verify_click(id, exp, sig)
     except ClickSignatureError as exc:
-        # The reason is logged, never returned. Telling a forger "expired"
-        # versus "signature mismatch" tells them which half to work on.
         log.warning("click signature rejected | id=%s | %s", id, exc)
         raise HTTPException(status_code=403, detail="Invalid or expired click URL")
 
@@ -539,21 +470,10 @@ async def track_click(
         log.error("impression %s has no usable destination_url", id)
         raise HTTPException(status_code=500, detail="Missing destination")
 
-    # Atomic check-and-set. mark_clicked flips the flag in a single UPDATE with
-    # `AND clicked = FALSE`, and returns True only if THIS call was the one that
-    # changed it. Awaited rather than spawned, because the return value gates
-    # whether we emit the event.
-    #
-    # The previous read-then-write version let two concurrent clicks on the same
-    # impression both observe clicked=False and both publish. A double-counted
-    # click is a corrupted training label and inflates that ad's measured CTR.
     if not await mark_clicked(id):
         log.info("duplicate click ignored | id=%s", id)
         return RedirectResponse(url=destination, status_code=302)
 
-    # No `label` field here. The training label comes from the LEFT JOIN in
-    # train_ctr.py, because a label needs the non-clicks too. A click stream on
-    # its own is 100% positives and cannot train anything.
     spawn(publish_event("clicks", {
         "impression_id": id,
         "ad_id":         impression["ad_id"],
@@ -565,9 +485,7 @@ async def track_click(
     return RedirectResponse(url=destination, status_code=302)
 
 
-# ---------------------------------------------------------------------------
 # GET /v1/impression — render confirmation pixel
-# ---------------------------------------------------------------------------
 
 @app.get("/v1/impression", tags=["Tracking"],
          summary="Confirm ad rendered in browser (1x1 pixel)")
@@ -583,9 +501,7 @@ async def impression_pixel(id: str = Query(..., description="impression_id")):
     return Response(content=gif, media_type="image/gif")
 
 
-# ---------------------------------------------------------------------------
 # POST /v1/conversion
-# ---------------------------------------------------------------------------
 
 @app.post("/v1/conversion", tags=["Tracking"],
           summary="Record a post-click conversion")
@@ -599,10 +515,6 @@ async def track_conversion(
     if impression is None:
         raise HTTPException(status_code=404, detail="Impression not found")
 
-    # Any valid key used to be able to post a conversion against ANY impression,
-    # and the 404-vs-200 difference let one publisher enumerate another's
-    # impression ids. Return 404 rather than 403 on a mismatch: 403 confirms the
-    # impression exists, which is the leak.
     if impression.get("publisher_id") != publisher.publisher_id:
         log.warning("cross-publisher conversion attempt: key=%s impression=%s",
                     publisher.publisher_id, conversion.impression_id)
@@ -627,9 +539,7 @@ async def track_conversion(
     return {"status": "ok", "impression_id": conversion.impression_id}
 
 
-# ---------------------------------------------------------------------------
 # GET /v1/stats
-# ---------------------------------------------------------------------------
 
 @app.get("/v1/stats", response_model=StatsResponse, tags=["Reporting"],
          summary="Publisher performance stats (last 30 days)")
@@ -645,13 +555,7 @@ async def publisher_stats(
     return await get_publisher_stats(publisher.publisher_id)
 
 
-# ---------------------------------------------------------------------------
 # Advertiser API — the demand side.
-#
-# Every endpoint here derives advertiser_id from the API KEY, never from a path
-# or body parameter. The moment an id is caller-supplied you owe an ownership
-# check on every field you touch, and one missed check is a cross-tenant write.
-# ---------------------------------------------------------------------------
 
 class CampaignRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
@@ -667,10 +571,6 @@ class CampaignRequest(BaseModel):
     @field_validator("target_keywords")
     @classmethod
     def normalise_keywords(cls, v: list[str]) -> list[str]:
-        # Normalised HERE, once, on write. features.extract_features lowercases
-        # ad keywords on every scoring call to compensate for inventory that was
-        # not normalised; doing it at the boundary means storage and scoring
-        # agree and the hot path does less work.
         return sorted({k.strip().lower() for k in v if k.strip()})
 
     @model_validator(mode="after")
@@ -692,10 +592,6 @@ class AdRequest(BaseModel):
     @field_validator("creative_html")
     @classmethod
     def must_have_click_macro(cls, v: str) -> str:
-        # Without the macro the creative renders but every click is untracked:
-        # no click row, no training label, and the advertiser is billed for
-        # impressions whose performance is invisible. Rejecting at write time
-        # beats discovering it in a week of flat CTR.
         if "{{CLICK_URL}}" not in v:
             raise ValueError("creative_html must contain {{CLICK_URL}} — without it "
                              "clicks cannot be tracked or attributed")
@@ -748,9 +644,6 @@ async def create_ad(
 ):
     note_key_usage(advertiser)
 
-    # Ownership check before the insert. The FK would accept any existing
-    # campaign_id, including another advertiser's, which would let anyone attach
-    # a creative to a competitor's budget.
     owned = {c["campaign_id"] for c in await db.list_campaigns(advertiser.advertiser_id)}
     if body.campaign_id not in owned:
         raise HTTPException(status_code=404, detail="Unknown campaign_id")
@@ -807,14 +700,7 @@ async def advertiser_stats(
     return await db.get_advertiser_stats(advertiser.advertiser_id)
 
 
-# ---------------------------------------------------------------------------
 # Provisioning — POST /admin/publishers, /admin/publishers/{id}/keys, ...
-#
-# Guarded by X-Admin-Token, which is a static shared secret. That is the right
-# amount of machinery for endpoints only you call, and definitively not enough
-# once other people need access — at that point this becomes real accounts with
-# an audit trail.
-# ---------------------------------------------------------------------------
 
 class CreatePublisherRequest(BaseModel):
     publisher_id: str = Field(..., min_length=3, max_length=64,
@@ -825,8 +711,7 @@ class CreatePublisherRequest(BaseModel):
     @field_validator("domain")
     @classmethod
     def check_scheme(cls, v: str) -> str:
-        # cors.add_origin raises on a bare hostname. Catching it here turns a
-        # 500 into a readable 422 that says which field is wrong.
+      
         if not v.startswith(("http://", "https://")):
             raise ValueError("domain must include the scheme, e.g. https://blog.example")
         return v.rstrip("/")
@@ -857,9 +742,6 @@ async def admin_create_publisher(body: CreatePublisherRequest):
                                    name="initial"):
         raise HTTPException(status_code=500, detail="Failed to store API key")
 
-    # Both caches updated in-process so the publisher's very first request
-    # works, rather than failing for up to a minute while they conclude the
-    # integration is broken.
     add_key_now(api_key, Publisher(publisher_id=body.publisher_id, key_id=key_id,
                                    key_prefix=key_prefix(api_key),
                                    domain=body.domain))
@@ -882,8 +764,7 @@ async def admin_create_publisher(body: CreatePublisherRequest):
 async def admin_create_key(publisher_id: str, name: Optional[str] = None):
     """
     Issue a second live key so a publisher can rotate without downtime: deploy
-    the new key, confirm traffic on it, then revoke the old one. This is the
-    whole reason keys are a separate table rather than a column on publishers.
+    the new key, confirm traffic on it, then revoke the old one.
     """
     if db._pool is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -962,9 +843,7 @@ async def admin_revoke_key(key_id: str):
     return {"key_id": key_id, "revoked": True}
 
 
-# ---------------------------------------------------------------------------
 # GET /health
-# ---------------------------------------------------------------------------
 
 async def _probe_postgres() -> str:
     if db._pool is None:
@@ -1000,17 +879,8 @@ async def _probe_clickhouse() -> str:
 @app.get("/health", tags=["System"], summary="Health check")
 async def health(deep: bool = False):
     """
-    Cheap by default — reports the connection state the lifespan established,
-    with no I/O. A load balancer polling this every second must not open a
-    Postgres connection every second.
-
-    `?deep=true` actually round-trips to each store. Use it after `compose up`
-    and in scripts/verify_stack.sh; do not point a health check at it.
-
-    `stores` is the thing to read: all four must say "up" before the pipeline is
-    whole. A gateway with clickhouse down still serves ads perfectly — it just
-    serves them from the baseline model forever and never learns anything, which
-    is exactly the failure that is easy to miss.
+    Reports the connection state the lifespan established,
+    with no I/O.
     """
     if deep:
         pg, redis_state, ch = await asyncio.gather(
@@ -1025,9 +895,6 @@ async def health(deep: bool = False):
         "postgres":   pg,
         "redis":      redis_state,
         "clickhouse": ch,
-        # is_connected() reflects whether the producer started, not whether the
-        # broker is reachable right now. dropped_count climbing while this says
-        # "up" means the broker went away after startup.
         "kafka":      "up" if is_connected() else "down",
     }
     degraded = [name for name, state in stores.items() if state != "up"]

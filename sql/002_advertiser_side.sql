@@ -1,11 +1,5 @@
 -- 002_advertiser_side.sql — advertiser-side tables + the servable_ads view.
---
--- Applied by scripts/bootstrap.py AFTER adplatform.db.SCHEMA (publishers,
--- impressions, conversions), because campaigns references advertisers and
--- api_keys references publishers.
---
--- Idempotent: every statement is CREATE ... IF NOT EXISTS / CREATE OR REPLACE,
--- so `make bootstrap` can be re-run safely.
+
 
 CREATE TABLE IF NOT EXISTS advertisers (
     advertiser_id   TEXT PRIMARY KEY,
@@ -23,9 +17,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
     target_cpm        DOUBLE PRECISION NOT NULL,
     floor_price       DOUBLE PRECISION NOT NULL DEFAULT 0,
     target_device     TEXT NOT NULL DEFAULT 'all',
-    -- Stored pre-normalised (lowercased, deduped, sorted) — see
-    -- CampaignRequest.normalise_keywords in gateway.py. Scoring reads this
-    -- straight off the servable_ads view with no further cleanup.
+    
     target_keywords   JSONB NOT NULL DEFAULT '[]'::jsonb,
     start_date        DATE,
     end_date          DATE,
@@ -49,10 +41,6 @@ CREATE TABLE IF NOT EXISTS ads (
 
 CREATE INDEX IF NOT EXISTS ads_campaign_idx ON ads (campaign_id);
 
--- One row per issued key. owner_type + owner_id together resolve to either a
--- publishers row or an advertisers row — see auth.load_keys_from_db's LEFT
--- JOIN, which is why there is no FK here (a single FK column can't point at
--- two different tables).
 CREATE TABLE IF NOT EXISTS api_keys (
     key_id          TEXT PRIMARY KEY,
     owner_type      TEXT NOT NULL CHECK (owner_type IN ('publisher', 'advertiser')),
@@ -68,11 +56,6 @@ CREATE TABLE IF NOT EXISTS api_keys (
 
 CREATE INDEX IF NOT EXISTS api_keys_owner_idx ON api_keys (owner_type, owner_id);
 
--- The view inventory.load_inventory() queries wholesale on every refresh.
--- Campaign-level fields (cpm, floor, device, keywords, budget) are joined onto
--- each ad row because bidding is per-creative but targeting and budget are set
--- per-campaign — see inventory._row_to_ad's note on budget_id being the
--- campaign id, not the ad id.
 CREATE OR REPLACE VIEW servable_ads AS
 SELECT
     a.ad_id,

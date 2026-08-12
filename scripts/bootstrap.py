@@ -5,23 +5,6 @@ bootstrap.py — bring a fresh stack to the point where the gateway can serve.
 Runs as a one-shot container in docker compose, before the gateway starts.
 Idempotent: safe to run on every `docker compose up`.
 
-Order is not arbitrary:
-
-  1. Kafka topics FIRST. ClickHouse's Kafka-engine tables start consuming the
-     instant they are created. Pointing one at a topic that does not exist yet
-     works (Redpanda auto-creates) but you get an auto-created topic with
-     default settings instead of the partition count you wanted, and it is
-     invisible until you wonder why throughput is flat.
-
-  2. Postgres schema. The gateway applies db.SCHEMA itself on startup, but
-     bootstrap runs first and the advertiser-side migration (002) needs the base
-     tables to reference. Applying SCHEMA here from the same constant the
-     gateway uses means there is one definition, not two that drift.
-
-  3. ClickHouse schema.sql, THEN kafka_sink.sql. The materialized views in
-     kafka_sink.sql have `TO ad_impressions` / `TO ad_clicks` targets. Creating
-     a MV whose destination does not exist fails outright, so the order matters.
-
 Everything waits for its dependency with a bounded retry rather than trusting
 compose healthchecks alone — a container being "healthy" and a database being
 ready to accept a CREATE TABLE are not the same moment.
@@ -49,11 +32,6 @@ log = logging.getLogger("bootstrap")
 
 SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
 
-# num_partitions on `impressions` is the one number here worth thinking about.
-# ClickHouse consumes with kafka_num_consumers=1, so extra partitions buy you
-# nothing today — but partitions cannot be reduced later, only added, and
-# repartitioning a live topic means resetting consumer offsets. Three is cheap
-# insurance for a single-node dev stack that might become three nodes.
 TOPICS = {
     "impressions": 3,
     "clicks": 3,
@@ -79,9 +57,7 @@ async def _retry(what: str, fn):
     raise RuntimeError(f"{what} never became available: {last}")
 
 
-# ---------------------------------------------------------------------------
 # SQL splitting
-# ---------------------------------------------------------------------------
 
 def split_sql(text: str) -> list[str]:
     """
@@ -111,9 +87,7 @@ def split_sql(text: str) -> list[str]:
     return [s.strip() for s in joined.split(";") if s.strip()]
 
 
-# ---------------------------------------------------------------------------
 # 1. Kafka topics
-# ---------------------------------------------------------------------------
 
 async def ensure_topics() -> None:
     from aiokafka.admin import AIOKafkaAdminClient, NewTopic
@@ -146,9 +120,7 @@ async def ensure_topics() -> None:
         await admin.close()
 
 
-# ---------------------------------------------------------------------------
 # 2. Postgres
-# ---------------------------------------------------------------------------
 
 async def apply_postgres() -> None:
     import asyncpg
@@ -181,9 +153,7 @@ async def apply_postgres() -> None:
         await conn.close()
 
 
-# ---------------------------------------------------------------------------
 # 3. ClickHouse
-# ---------------------------------------------------------------------------
 
 def _ch_client():
     import clickhouse_connect
@@ -206,16 +176,6 @@ async def apply_clickhouse() -> None:
         connect,
     )
 
-    # Order matters. schema.sql creates the destination tables, kafka_sink.sql
-    # creates the consumers and MVs that write into them, and numbered
-    # migrations then alter both. 003 drops and recreates kafka_impressions, so
-    # it MUST run after kafka_sink.sql, not before.
-    #
-    # Every file here is idempotent (IF EXISTS / IF NOT EXISTS), which is what
-    # lets bootstrap re-run on every `docker compose up` without a migrations
-    # table. That stops being true the moment someone writes a migration with a
-    # bare ALTER -- at which point this list should be replaced with a real
-    # migration runner that records what it has applied.
     for filename in ("schema.sql", "kafka_sink.sql", "003_campaign_budgets.sql"):
         path = SQL_DIR / filename
         if not path.exists():

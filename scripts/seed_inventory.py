@@ -5,34 +5,6 @@
 #   python -m scripts.seed_inventory --dry-run          # print the plan, touch nothing
 #   python -m scripts.seed_inventory --rotate-key       # issue a fresh publisher key
 #   python -m scripts.seed_inventory --purge            # delete seeded rows first
-#
-# Runs AFTER scripts.bootstrap, which creates the tables. This only inserts
-# rows. It talks to Postgres directly rather than going through the gateway's
-# HTTP API, because seeding must work before you have a key to call the API
-# with — which is the chicken-and-egg this script exists to break.
-#
-# ---------------------------------------------------------------------------
-# WHY THE VARIETY MATTERS
-# ---------------------------------------------------------------------------
-# A seed of twelve identical campaigns gives you a stack that returns 200s and
-# a CTR model that can never learn anything: every feature is constant, every
-# auction has the same winner, and second-price clearing degenerates because
-# all bids tie. So the generated campaigns deliberately spread across device
-# targeting, CPM, floor price, keyword sets and creation date — the five
-# things stage-1 filtering and the feature vector actually read.
-#
-# Ad creation dates are backdated across a 90-day window on purpose. ad_age_days
-# was a dead feature (always 0.0) until the created_at field was added to
-# rtb.Ad; seeding everything with now() would leave it dead in a different way.
-#
-# ---------------------------------------------------------------------------
-# IDEMPOTENCE
-# ---------------------------------------------------------------------------
-# Every insert is ON CONFLICT DO NOTHING and every generated id is deterministic
-# (seed_adv_0001, seed_camp_0001_a, ...), so `make seed` twice is the same as
-# once. The one exception is the API key, which cannot be idempotent: only its
-# HMAC is stored, so a key that already exists cannot be reprinted. Default
-# behaviour is to leave it alone and say so; --rotate-key revokes and reissues.
 
 from __future__ import annotations
 
@@ -54,20 +26,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("seed")
 
-# Everything this script writes is prefixed so --purge can find it again and a
-# human reading the ads table can tell demo data from real data at a glance.
 PREFIX = "seed_"
 DEMO_PUBLISHER_ID = "pub_demo"
 DEMO_DOMAIN = "demo.localhost"
 
-# Fixed seed: two runs on two machines produce the same inventory, so when a
-# bid response differs between them it is the code that differs, not the data.
 RNG_SEED = 20260731
 
 
-# ---------------------------------------------------------------------------
 # Generated content
-# ---------------------------------------------------------------------------
 
 VERTICALS = [
     ("acme_cloud",   "Acme Cloud",        ["cloud", "devops", "kubernetes", "hosting"]),
@@ -121,7 +87,6 @@ def build_plan(n_advertisers: int) -> list[dict]:
 
     for i in range(n_advertisers):
         slug, name, kws = VERTICALS[i % len(VERTICALS)]
-        # Past len(VERTICALS) the slugs would collide; suffix keeps ids unique.
         if i >= len(VERTICALS):
             slug = f"{slug}_{i // len(VERTICALS)}"
 
@@ -137,8 +102,6 @@ def build_plan(n_advertisers: int) -> list[dict]:
                 "name": f"{name} — {'brand' if c == 0 else 'performance'}",
                 "daily_budget_usd": float(rng.choice([50, 100, 250, 500, 1000])),
                 "target_cpm": target_cpm,
-                # Floor sits below target_cpm, otherwise the campaign can never
-                # clear its own floor and the ad is dead weight in the auction.
                 "floor_price": round(target_cpm * rng.uniform(0.2, 0.6), 2),
                 "target_device": rng.choice(DEVICES),
                 "target_keywords": normalise_keywords(
@@ -163,7 +126,6 @@ def build_plan(n_advertisers: int) -> list[dict]:
                             chr(97 + a),
                         ),
                         "destination_url": f"https://{slug}.example.com/?utm_source=adplatform",
-                        # Spread across 90 days so ad_age_days has a real range.
                         "created_at": now - timedelta(days=rng.randint(0, 90),
                                                       hours=rng.randint(0, 23)),
                     }
@@ -181,15 +143,11 @@ def build_plan(n_advertisers: int) -> list[dict]:
     return plan
 
 
-# ---------------------------------------------------------------------------
 # Writing
-# ---------------------------------------------------------------------------
 
 async def insert_plan(conn: asyncpg.Connection, plan: list[dict]) -> tuple[int, int, int]:
     n_adv = n_camp = n_ad = 0
 
-    # One transaction: a half-seeded database where campaigns exist but ads do
-    # not is harder to reason about than no seed at all.
     async with conn.transaction():
         for adv in plan:
             await conn.execute(
@@ -215,9 +173,6 @@ async def insert_plan(conn: asyncpg.Connection, plan: list[dict]) -> tuple[int, 
                     camp["campaign_id"], camp["advertiser_id"], camp["name"],
                     camp["daily_budget_usd"], camp["target_cpm"], camp["floor_price"],
                     camp["target_device"],
-                    # asyncpg will not adapt a Python list into jsonb; db.py
-                    # registers no codec, so dump it here. inventory._row_to_ad
-                    # decodes the string on the way back out.
                     json.dumps(camp["target_keywords"]),
                     camp["start_date"], camp["end_date"],
                 )
@@ -301,10 +256,7 @@ async def purge(conn: asyncpg.Connection) -> None:
             result = await conn.execute(sql)
             log.info("purge: %s", result)
 
-
-# ---------------------------------------------------------------------------
 # Entry point
-# ---------------------------------------------------------------------------
 
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Seed demo inventory into Postgres.")
@@ -321,8 +273,6 @@ async def main() -> int:
         log.error("--advertisers must be at least 1")
         return 2
 
-    # Refuse to scatter demo creatives through a production ads table. The check
-    # is cheap and the mistake is not reversible from inside this script.
     if settings.is_production:
         log.error("refusing to seed with ENV=production")
         return 2
@@ -352,7 +302,6 @@ async def main() -> int:
         return 1
 
     try:
-        # Fail with a useful message rather than an UndefinedTableError.
         if not await conn.fetchval("SELECT to_regclass('public.servable_ads') IS NOT NULL"):
             log.error("servable_ads view missing — run `make bootstrap` first")
             return 1

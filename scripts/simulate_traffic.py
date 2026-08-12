@@ -1,60 +1,4 @@
 # simulate_traffic.py — generate a labelled dataset the CTR model can learn from.
-#
-#     python -m scripts.simulate_traffic --impressions 20000
-#     python -m scripts.simulate_traffic --impressions 20000 --concurrency 32
-#     python -m scripts.simulate_traffic --check          # readiness only, no traffic
-#
-# WHY A SIMULATOR AND NOT JUST TRAFFIC
-# ------------------------------------
-# train_ctr.py refuses to train on data that cannot teach it anything, and it is
-# right to. Three separate gates have to be cleared:
-#
-#   * enough rows to split three ways (train / valid / calib)
-#   * at least one positive label
-#   * AUC > 0.55 on the calibration split
-#
-# The last one is the hard one, and it is why this file is more than a for-loop
-# around curl. If clicks are random, no model can beat 0.55 no matter how many
-# rows you generate, and training correctly refuses to promote. The data needs a
-# LEARNABLE STRUCTURE: a true click probability that actually depends on the
-# features the model gets to see.
-#
-# WHAT SIGNAL IS PLANTED
-# ----------------------
-# Each simulated click is drawn from a true CTR built out of exactly three
-# things, all of them visible in the feature vector:
-#
-#   1. per-ad quality      -> shows up via ad_ctr_prior / pair_ctr_prior
-#   2. keyword relevance   -> shows up via keyword_overlap, overlap_ratio
-#   3. device effect       -> shows up via is_mobile / is_desktop / is_tablet
-#
-# and one thing that is NOT visible: per-user propensity. That is deliberate.
-# Real CTR has irreducible noise, and a simulator where the model can reach
-# AUC 0.99 is not testing anything — it is testing that you can fit a formula
-# you wrote yourself. The hidden term keeps achievable AUC in the 0.65-0.80
-# range, which is roughly what real display advertising looks like.
-#
-# TIME TRAVEL: THE ONE THING THAT WILL CONFUSE YOU
-# ------------------------------------------------
-# train_ctr.py's query ends with:
-#
-#     AND i.ts < now() - INTERVAL 2 HOUR
-#
-# LABEL_CUTOFF_HOURS = 2. An impression logged one minute ago is EXCLUDED from
-# training, because its click may not have arrived yet and counting it as a
-# negative would be a lie. That is correct behaviour, and it means traffic you
-# generate right now is not trainable for two hours.
-#
-# So this script does NOT rely on the gateway's own clock for the ClickHouse
-# rows. It writes impressions directly to ClickHouse with backdated timestamps
-# spread over the last few days (--spread-days), so training can run
-# immediately. The bid requests still go through the real gateway — the auction,
-# budget checks, and Kafka path are all exercised — but the trainable rows are
-# inserted separately with historical ts values.
-#
-# This is a deliberate, disclosed shortcut for local development. It is NOT how
-# you would validate the pipeline in production, where you would generate load
-# and wait out the cutoff.
 
 from __future__ import annotations
 
@@ -89,16 +33,12 @@ KEYWORD_POOL = [
     "security", "vpn", "privacy", "food", "delivery", "recipes", "pets", "dogs",
 ]
 
-# Device multipliers on the true CTR. Mobile over-indexes on display, which is
-# both realistic and gives is_mobile/is_desktop something to separate.
 DEVICE_EFFECT = {"mobile": 1.35, "desktop": 0.75, "tablet": 1.0}
 
 BASE_CTR = 0.02
 
 
-# ---------------------------------------------------------------------------
 # The latent world
-# ---------------------------------------------------------------------------
 
 class World:
     """
@@ -108,8 +48,6 @@ class World:
 
     def __init__(self, ad_ids: list[str], rng: random.Random):
         self.rng = rng
-        # Log-normal ad quality: most ads mediocre, a few much better. A uniform
-        # spread would be easier to learn than anything real.
         self.ad_quality = {
             ad_id: math.exp(rng.gauss(0.0, 0.55)) for ad_id in ad_ids
         }
@@ -133,9 +71,7 @@ class World:
         return min(p, 0.60)
 
 
-# ---------------------------------------------------------------------------
 # Readiness
-# ---------------------------------------------------------------------------
 
 async def preflight(client: httpx.AsyncClient, base: str) -> dict:
     """Fail early and specifically rather than after 20k pointless requests."""
@@ -162,9 +98,7 @@ async def preflight(client: httpx.AsyncClient, base: str) -> dict:
     return health
 
 
-# ---------------------------------------------------------------------------
 # Traffic
-# ---------------------------------------------------------------------------
 
 async def one_request(client, base, key, world, rng, stats) -> dict | None:
     user_id = f"u_{rng.randint(1, 4000)}"
@@ -189,8 +123,6 @@ async def one_request(client, base, key, world, rng, stats) -> dict | None:
         return None
 
     if r.status_code == 429:
-        # BID_RATE_LIMIT defaults to 120/minute — two requests a second. The
-        # gateway is behaving correctly; the simulator has to slow down.
         stats["rate_limited"] += 1
         return None
     if r.status_code == 204:
@@ -205,15 +137,12 @@ async def one_request(client, base, key, world, rng, stats) -> dict | None:
     bid = r.json()
     stats["filled"] += 1
 
-    # Overlap the model will see, recomputed here to drive the true CTR.
     overlap = len(set(keywords) & set(KEYWORD_POOL[:12]))
     p = world.true_ctr(bid["ad_id"], user_id, device, overlap)
     clicked = rng.random() < p
 
     if clicked:
         stats["clicks"] += 1
-        # Follow the SIGNED url out of the creative — exercises the real
-        # signature path rather than assuming it works.
         import re
         m = re.search(r'href="([^"]+)"', bid.get("ad_markup", ""))
         if m:
@@ -263,7 +192,6 @@ async def run_traffic(n: int, concurrency: int, base: str, key: str,
                      done, n, stats["filled"], stats["clicks"],
                      stats["rate_limited"], stats["errors"], rate)
 
-            # Bail out rather than spend twenty minutes collecting 429s.
             if done >= 500 and stats["rate_limited"] > done * 0.5:
                 raise SystemExit(
                     f"\n{stats['rate_limited']} of {done} requests were rate "
@@ -291,9 +219,7 @@ async def run_traffic(n: int, concurrency: int, base: str, key: str,
     return results
 
 
-# ---------------------------------------------------------------------------
 # Backdated rows for training
-# ---------------------------------------------------------------------------
 
 def feature_vector(row: dict, ts: datetime, ad_stats: dict) -> list[float]:
     """
@@ -342,9 +268,6 @@ def insert_backdated(rows: list[dict], spread_days: float, dsn_host: str,
     imp_rows, click_rows = [], []
     ad_stats: dict[str, tuple[int, int]] = {}
 
-    # Oldest first, so the running ad_ctr_prior a row sees reflects only
-    # EARLIER rows. Computing it over the whole dataset would leak the label
-    # into the feature and produce a gorgeous, meaningless AUC.
     for i, row in enumerate(rows):
         age_hours = 3.0 + (spread_days * 24.0) * (1.0 - i / max(len(rows), 1))
         ts = now - timedelta(hours=age_hours)
@@ -427,7 +350,6 @@ async def main() -> int:
         health = await preflight(c, args.base_url)
     del health
 
-    # Ad ids come from a probe round so quality is assigned to ads that exist.
     async with httpx.AsyncClient() as c:
         probe = []
         for _ in range(30):

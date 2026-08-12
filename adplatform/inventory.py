@@ -1,37 +1,4 @@
 # inventory.py — the live ad inventory, cached in process.
-#
-# Replaces rtb.MOCK_ADS as the source of servable ads.
-#
-# ---------------------------------------------------------------------------
-# WHY A CACHE AND NOT A QUERY PER BID
-# ---------------------------------------------------------------------------
-# The obvious implementation is the one written in get_eligible_ads' docstring:
-#
-#     SELECT * FROM ads WHERE status='active' AND target_device IN (...)
-#
-# One Postgres round trip is 1-2ms of a ~20ms budget, and it puts the database
-# on the critical path of every auction — a slow query or a failover and you
-# stop bidding entirely. Worse, it is the same query with the same handful of
-# results tens of thousands of times a second.
-#
-# Total inventory is small. Even 100k live ads with creatives is a few hundred
-# MB, and realistically you have hundreds. So: load everything once, refresh in
-# the background, filter in memory. Same pattern as cors.py and auth.py, which
-# is deliberate — three caches behaving three different ways is how you end up
-# unsure which one is stale.
-#
-# ---------------------------------------------------------------------------
-# FAILURE POLICY: keep serving
-# ---------------------------------------------------------------------------
-# A failed refresh keeps the previous snapshot. Stale inventory means an ad that
-# was paused two minutes ago might serve once more; an empty snapshot means the
-# platform returns no_fill for everything and every publisher's page goes blank.
-# The first is a rounding error in someone's budget, the second is an outage.
-#
-# On a COLD cache (never loaded) we fall back to rtb.MOCK_ADS in development so
-# the thing boots and demos without Postgres, and serve nothing in production.
-# Silently serving five hardcoded example creatives to real publisher traffic is
-# not a failure mode anyone wants.
 
 from __future__ import annotations
 
@@ -51,10 +18,7 @@ _ads: list = []
 _loaded_at: Optional[float] = None
 _load_failures = 0
 
-
-# ---------------------------------------------------------------------------
 # Loading
-# ---------------------------------------------------------------------------
 
 def _row_to_ad(row) -> object:
     """
@@ -70,8 +34,6 @@ def _row_to_ad(row) -> object:
     from .rtb import Ad
 
     keywords = row["target_keywords"]
-    # asyncpg returns JSONB as str unless a codec is registered. db.py does not
-    # register one, so decode here rather than assuming.
     if isinstance(keywords, str):
         keywords = json.loads(keywords)
 
@@ -111,8 +73,6 @@ async def load_inventory(pool) -> int:
         try:
             fresh.append(_row_to_ad(row))
         except Exception:
-            # One malformed row must not cost you the whole inventory. Same
-            # reasoning as kafka_skip_broken_messages in kafka_sink.sql.
             log.exception("skipping unloadable ad %s", row.get("ad_id"))
 
     _ads = fresh
@@ -125,11 +85,6 @@ async def load_inventory(pool) -> int:
 async def refresh_inventory_loop(pool, interval: Optional[int] = None) -> None:
     """
     Background refresh, started in the lifespan and cancelled on shutdown.
-
-    PAUSE LATENCY: an ad paused in the API keeps serving until the next refresh.
-    That is why invalidate() exists and why the default interval is 60s rather
-    than the 300s used for CORS — an advertiser watching a runaway creative
-    wants it stopped now, and "wait five minutes" is not an acceptable answer.
     """
     interval = interval or settings.inventory_refresh_seconds
     log.info("inventory refresh loop started — interval: %ds", interval)
@@ -150,17 +105,11 @@ async def invalidate(pool) -> int:
     Force an immediate reload. Called after any write that changes what is
     servable, so an advertiser sees their edit take effect on the next request
     instead of within the refresh window.
-
-    Reloads everything rather than patching the one changed ad: the write may
-    have changed campaign-level fields shared by several ads, and a full reload
-    of a few hundred rows is cheaper than reasoning about which ones moved.
     """
     return await load_inventory(pool)
 
 
-# ---------------------------------------------------------------------------
 # Read path
-# ---------------------------------------------------------------------------
 
 def current_inventory() -> list:
     """

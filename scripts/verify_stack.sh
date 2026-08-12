@@ -1,10 +1,3 @@
-#!/usr/bin/env bash
-# verify_stack.sh — the "done when" for step 2, as an executable check.
-#
-#   docker compose up -d && ./scripts/verify_stack.sh
-#
-# Exits non-zero on the first failure so you can chain it in CI.
-
 set -uo pipefail
 
 GATEWAY="${GATEWAY:-http://localhost:8000}"

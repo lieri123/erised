@@ -1,10 +1,3 @@
-#!/usr/bin/env bash
-# preflight.sh — run BEFORE `make up`. Catches the three things that actually
-# make step 2 fail: no docker, a port already taken by a service you already run,
-# and an image tag that does not exist.
-#
-#   ./scripts/preflight.sh
-
 set -uo pipefail
 
 fail=0
@@ -27,8 +20,7 @@ else
 fi
 
 hd "2. Ports the stack publishes"
-# If something is ALREADY listening, you have that service running natively.
-# That is the fork in the road — see the note at the end.
+
 check_port() {
   local port=$1 name=$2
   if command -v ss >/dev/null 2>&1; then
@@ -53,8 +45,6 @@ check_port 9644  redpanda-admin
 check_port 8000  gateway
 
 hd "3. Image tags actually resolve"
-# Pinned tags rot. Rather than trust a tag someone wrote months ago, resolve it
-# now and print what you got so you can pin the digest yourself.
 for img in \
   "postgres:16-alpine" \
   "redis:7-alpine" \
