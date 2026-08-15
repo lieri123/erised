@@ -1,5 +1,6 @@
 # rtb.py — Real-Time Bidding engine, stage 1.
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 from . import inventory
