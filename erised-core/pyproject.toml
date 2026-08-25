@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "erised-core"
+description = "Rust matching core for the Erised ad platform."
+requires-python = ">=3.11"
+dynamic = ["version"]
+
+[tool.maturin]
+manifest-path = "crates/erised-py/Cargo.toml"
+module-name = "erised_core"
+# abi3-py311 is set in the crate, so one wheel covers the whole 3.11/3.12 CI
+# matrix instead of building a separate wheel per interpreter.

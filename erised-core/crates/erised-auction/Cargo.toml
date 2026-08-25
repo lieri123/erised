@@ -1,0 +1,10 @@
+[package]
+name = "erised-auction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Second-price auction with epsilon-greedy exploration for the Erised ad platform."
+
+[dependencies]
+
+[dev-dependencies]

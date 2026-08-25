@@ -1,0 +1,14 @@
+[package]
+name = "erised-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Python bindings for the Erised matching core."
+
+[lib]
+name = "erised_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+erised-auction = { path = "../erised-auction" }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
