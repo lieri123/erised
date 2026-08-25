@@ -38,3 +38,9 @@ shell-pg:
 
 train:             ## train a CTR model from ClickHouse into models/
 	docker compose run --rm bootstrap python -m adplatform.ml.train_ctr --days 7 --out /app/models
+
+publish:           ## upload models/current to S3 and flip the pointer
+	python -m scripts.publish_model models/current
+
+model-status:      ## show which model version is currently live
+	python -m scripts.publish_model --show

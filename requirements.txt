@@ -10,6 +10,10 @@ redis>=5.0
 clickhouse-connect>=0.7
 aiokafka>=0.10
 
+# AWS — only imported when MODEL_ARTIFACT_BACKEND=s3. Listed here rather than
+# as an extra because the deployed image needs it and there is exactly one image.
+boto3>=1.34
+
 # Model
 numpy>=1.26
 xgboost>=2.0

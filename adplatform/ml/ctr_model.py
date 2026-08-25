@@ -12,6 +12,14 @@ from pathlib import Path
 import numpy as np
 
 from ..settings import settings
+from .artifacts import (
+    CALIBRATOR_FILE,
+    METADATA_FILE,
+    MODEL_FILE,
+    ArtifactStore,
+    LocalArtifactStore,
+    build_store,
+)
 from .features import (
     FEATURE_VERSION,
     N_FEATURES,
@@ -42,11 +50,31 @@ class _Artifact:
 
 
 class CtrModel:
+    """
+    Holds the live artifact and scores against it.
 
-    def __init__(self, artifact_dir: str | Path | None = None):
-        self.artifact_dir = Path(artifact_dir or settings.model_dir)
+    Where the artifact comes from is the store's problem — a local directory in
+    development, an S3 prefix behind a `current.json` pointer when there is more
+    than one replica. Everything below the store boundary loads from a local
+    directory either way.
+    """
+
+    def __init__(
+        self,
+        artifact_dir: str | Path | None = None,
+        store: ArtifactStore | None = None,
+    ):
+        # An explicit directory always means local — that is what the tests and
+        # the training script pass, and neither should reach for S3.
+        if store is not None:
+            self.store = store
+        elif artifact_dir is not None:
+            self.store = LocalArtifactStore(artifact_dir)
+        else:
+            self.store = build_store()
+
         self._artifact: _Artifact | None = None
-        self._loaded_stamp: float | None = None
+        self._loaded_token: str | None = None
         self._load_lock = threading.Lock()
 
     # -- properties ---------------------------------------------------------
@@ -64,20 +92,24 @@ class CtrModel:
     def load(self) -> bool:
         """
         Load or reload the artifact. Returns True if a new model became active.
-        Safe to call repeatedly; no-ops when the on-disk artifact is unchanged.
-        Call from a background task, never from a request handler.
+        Safe to call repeatedly; no-ops when the published artifact is unchanged.
+        Call from a background task, never from a request handler — the S3 store
+        does blocking network I/O in here.
         """
-        meta_path = self.artifact_dir / "metadata.json"
-        if not meta_path.exists():
-            return False
-
         with self._load_lock:
             try:
-                stamp = meta_path.stat().st_mtime
-                if self._loaded_stamp == stamp:
-                    return False
+                resolved = self.store.resolve(self._loaded_token)
+            except Exception:
+                log.exception("artifact store %s failed; keeping previous model",
+                              self.store.describe())
+                return False
 
-                meta = json.loads(meta_path.read_text())
+            if resolved is None:
+                return False
+
+            try:
+                directory = resolved.directory
+                meta = json.loads((directory / METADATA_FILE).read_text())
 
                 trained_version = meta.get("feature_version")
                 if trained_version != FEATURE_VERSION:
@@ -86,20 +118,25 @@ class CtrModel:
                         "serving code is at %s. Retrain before deploying.",
                         meta.get("model_version"), trained_version, FEATURE_VERSION,
                     )
+                    # Record the token anyway. Without this, every refresh tick
+                    # re-resolves and re-rejects the same bad artifact, which in
+                    # the S3 case is a paid GET every 60 seconds forever.
+                    self._loaded_token = resolved.token
                     return False
 
                 if meta.get("n_features") != N_FEATURES:
                     log.error("refusing model: expected %d features, artifact has %s",
                               N_FEATURES, meta.get("n_features"))
+                    self._loaded_token = resolved.token
                     return False
 
                 import xgboost as xgb
 
                 booster = xgb.Booster()
-                booster.load_model(str(self.artifact_dir / "model.json"))
+                booster.load_model(str(directory / MODEL_FILE))
 
                 calibrator = None
-                cal_path = self.artifact_dir / "calibrator.pkl"
+                cal_path = directory / CALIBRATOR_FILE
                 if cal_path.exists():
                     with cal_path.open("rb") as fh:
                         calibrator = pickle.load(fh)
@@ -110,15 +147,26 @@ class CtrModel:
                     keep_rate=float(meta.get("negative_keep_rate", 1.0)),
                     model_version=str(meta.get("model_version", "unknown")),
                 )
-                self._loaded_stamp = stamp
-                log.info("loaded CTR model %s (calibrated=%s)",
-                         self._artifact.model_version, calibrator is not None)
+                self._loaded_token = resolved.token
+                log.info("loaded CTR model %s from %s (calibrated=%s)",
+                         self._artifact.model_version, self.store.describe(),
+                         calibrator is not None)
                 return True
 
             except Exception:
-                # Keep serving whatever was already loaded.
+                # Keep serving whatever was already loaded. Deliberately does
+                # NOT record the token — a transient read failure must be
+                # retried, unlike a structurally incompatible artifact above.
                 log.exception("CTR model load failed; keeping previous model")
                 return False
+
+    def status(self) -> dict:
+        """For /health. Cheap, no I/O."""
+        return {
+            "trained": self.is_trained,
+            "model_version": self.model_version,
+            "source": self.store.describe(),
+        }
 
     # -- inference ----------------------------------------------------------
 
@@ -138,7 +186,11 @@ class CtrModel:
         if not vectors:
             return [], []
 
-        artifact = self._artifact 
+        # Read the reference once. load() rebinds self._artifact wholesale from
+        # a background thread, so taking a local reference means a swap that
+        # lands mid-request cannot pair one model's booster with another's
+        # calibrator.
+        artifact = self._artifact
 
         if artifact is None:
             return [
@@ -170,5 +222,6 @@ class CtrModel:
         return float(np.clip(base * boost, MIN_CTR, MAX_CTR))
 
 
-# Process-wide singleton, imported by rtb.py.
+# Process-wide singleton, imported by rtb.py. Building the store reads settings
+# but opens no connections, so import stays cheap.
 ctr_model = CtrModel()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -102,6 +103,23 @@ class Settings:
     kafka_request_timeout_ms: int = field(
         default_factory=lambda: _int("KAFKA_REQUEST_TIMEOUT_MS", 5000)
     )
+    # PLAINTEXT is correct on a compose network and wrong on anything routable.
+    # Redpanda on EC2 inside the VPC can stay PLAINTEXT; MSK cannot.
+    kafka_security_protocol: str = field(
+        default_factory=lambda: _str("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT").upper()
+    )
+    kafka_sasl_mechanism: str = field(
+        default_factory=lambda: _str("KAFKA_SASL_MECHANISM", "PLAIN").upper()
+    )
+    kafka_sasl_username: str = field(
+        default_factory=lambda: _str("KAFKA_SASL_USERNAME", "")
+    )
+    kafka_sasl_password: str = field(
+        default_factory=lambda: _str("KAFKA_SASL_PASSWORD", "")
+    )
+    # Empty means "use the system trust store", which is right for MSK public
+    # endpoints and wrong for a self-signed Redpanda cert.
+    kafka_ssl_cafile: str = field(default_factory=lambda: _str("KAFKA_SSL_CAFILE", ""))
 
     # -- ClickHouse ---------------------------------------------------------
     clickhouse_host: str = field(
@@ -164,8 +182,30 @@ class Settings:
         default_factory=lambda: _int("INVENTORY_REFRESH_SECONDS", 60)
     )
 
-    # -- model + stats refresh ----------------------------------------------
+    # -- model artifacts ----------------------------------------------------
+    # "local" reads a directory (a bind mount in compose). "s3" reads a
+    # current.json pointer and downloads the version it names. See
+    # adplatform/ml/artifacts.py for why the pointer exists.
+    model_artifact_backend: str = field(
+        default_factory=lambda: _str("MODEL_ARTIFACT_BACKEND", "local")
+    )
     model_dir: str = field(default_factory=lambda: _str("MODEL_DIR", "models/current"))
+    model_s3_bucket: str = field(default_factory=lambda: _str("MODEL_S3_BUCKET", ""))
+    model_s3_prefix: str = field(
+        default_factory=lambda: _str("MODEL_S3_PREFIX", "models")
+    )
+    # Task-local scratch. Fargate gives each task an ephemeral volume; a fresh
+    # task downloads once at boot and then only on promotion.
+    model_cache_dir: str = field(
+        default_factory=lambda: _str(
+            "MODEL_CACHE_DIR", str(Path(tempfile.gettempdir()) / "erised-models")
+        )
+    )
+    aws_region: str = field(
+        default_factory=lambda: _str("AWS_REGION", _str("AWS_DEFAULT_REGION", "us-east-1"))
+    )
+
+    # -- stats refresh ------------------------------------------------------
     model_refresh_seconds: int = field(
         default_factory=lambda: _int("MODEL_REFRESH_SECONDS", 60)
     )
@@ -230,13 +270,28 @@ class Settings:
             problems.append(
                 "CLICKHOUSE_PASSWORD is empty — port 8123 is unauthenticated"
             )
+        if self.model_artifact_backend.lower() == "local":
+            problems.append(
+                "MODEL_ARTIFACT_BACKEND=local in production — with more than one "
+                "replica each task loads whatever its own filesystem happens to "
+                "hold, and they will silently serve different models"
+            )
+        if self.model_artifact_backend.lower() == "s3" and not self.model_s3_bucket:
+            problems.append("MODEL_ARTIFACT_BACKEND=s3 but MODEL_S3_BUCKET is empty")
+        if self.kafka_security_protocol.startswith("SASL") and not self.kafka_sasl_username:
+            problems.append(
+                f"KAFKA_SECURITY_PROTOCOL={self.kafka_security_protocol} but "
+                "KAFKA_SASL_USERNAME is empty — the producer will fail to connect "
+                "and events will be dropped silently"
+            )
         return problems
 
     def describe(self) -> str:
         """One-line summary for the startup log. Never logs secrets."""
         return (
             f"env={self.env} pg={_redact(self.database_url)} "
-            f"kafka={self.kafka_bootstrap} "
+            f"kafka={self.kafka_bootstrap}/{self.kafka_security_protocol} "
+            f"model={self.model_artifact_backend} "
             f"clickhouse={self.clickhouse_host}:{self.clickhouse_port} "
             f"redis={_redact(self.redis_url)} base_url={self.public_base_url}"
         )

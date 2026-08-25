@@ -38,6 +38,48 @@ def _serialize(payload: dict) -> bytes:
     return json.dumps(payload, default=_default, separators=(",", ":")).encode()
 
 
+def _security_options() -> dict:
+    """
+    Translate the KAFKA_SECURITY_* settings into aiokafka producer kwargs.
+
+    Returns an empty dict for PLAINTEXT so the compose path is byte-for-byte the
+    producer it always was — no ssl module import, no behaviour change on a
+    stack that does not need transport security.
+
+    The four protocols map cleanly: PLAINTEXT (nothing), SSL (TLS, no auth),
+    SASL_PLAINTEXT (auth in the clear — only defensible inside a VPC), and
+    SASL_SSL (both, which is what a managed broker will insist on).
+    """
+    protocol = settings.kafka_security_protocol
+    if protocol == "PLAINTEXT":
+        return {}
+
+    if protocol not in {"SSL", "SASL_PLAINTEXT", "SASL_SSL"}:
+        raise ValueError(
+            f"KAFKA_SECURITY_PROTOCOL={protocol!r} is not one of "
+            "PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL"
+        )
+
+    options: dict = {"security_protocol": protocol}
+
+    if protocol in {"SSL", "SASL_SSL"}:
+        import ssl
+
+        # cafile=None falls back to the system trust store, which is what a
+        # managed broker with a public CA needs. A self-signed Redpanda cert
+        # needs KAFKA_SSL_CAFILE pointing at the CA that signed it.
+        options["ssl_context"] = ssl.create_default_context(
+            cafile=settings.kafka_ssl_cafile or None
+        )
+
+    if protocol.startswith("SASL"):
+        options["sasl_mechanism"] = settings.kafka_sasl_mechanism
+        options["sasl_plain_username"] = settings.kafka_sasl_username
+        options["sasl_plain_password"] = settings.kafka_sasl_password
+
+    return options
+
+
 async def init_kafka() -> None:
     """
     Start the producer. If Redpanda is unreachable the gateway
@@ -54,10 +96,12 @@ async def init_kafka() -> None:
             compression_type="gzip",
             acks=1,
             request_timeout_ms=settings.kafka_request_timeout_ms,
+            **_security_options(),
         )
         await _producer.start()
         _enabled = True
-        log.info("Kafka producer connected to %s", settings.kafka_bootstrap)
+        log.info("Kafka producer connected to %s (%s)",
+                 settings.kafka_bootstrap, settings.kafka_security_protocol)
     except Exception as e:
         if _producer is not None:
             try:
