@@ -1,38 +1,24 @@
 # artifacts.py — where a model artifact comes from.
 #
-# WHY THIS EXISTS
+# One process can treat models/current as a directory and reload on mtime. N
+# Fargate tasks share no disk, so each needs to fetch, and fetching files
+# individually has no atomic point: a task can pull the new model.json next to
+# the old metadata.json and score against unverified features.
 #
-# With one process, `models/current` is a directory on disk and reloading means
-# stat'ing metadata.json. With N Fargate tasks there is no shared disk, and the
-# naive fixes are all wrong in the same way:
+# So: versioned prefixes, never mutated after upload,
 #
-#   - EFS mounted into every task: works, costs money, and turns a read-mostly
-#     artifact fetch into a network filesystem on the serving path.
-#   - Bake the model into the image: every retrain is a redeploy, and the
-#     nightly training job cannot ship its own output.
-#   - Each task polls S3 for `model.json` directly: a task can observe the new
-#     model.json alongside the old metadata.json, load a booster whose
-#     feature_version it has not verified, and score garbage. There is no
-#     moment at which "the artifact" changes atomically.
+#     s3://bucket/models/v20260115_031200/{model,calibrator,metadata}
 #
-# The pointer solves the last one. Versioned artifacts are written to immutable
-# prefixes that are never mutated after upload:
+# and one small object naming the live one,
 #
-#     s3://bucket/models/v20260115_031200/{model.json,calibrator.pkl,metadata.json}
+#     s3://bucket/models/current.json -> {"model_version": "v20260115_031200"}
 #
-# and a single small object names the live one:
-#
-#     s3://bucket/models/current.json  ->  {"model_version": "v20260115_031200"}
-#
-# Promotion is one PUT of that pointer. S3 gives read-after-write consistency on
-# it, so the swap is atomic from every replica's point of view: a task either
-# sees the old version or the new one, never a mixture. Replicas converge within
-# one MODEL_REFRESH_SECONDS window without coordinating with each other.
-#
-# Rollback is the same PUT with an older version string, which is worth more
-# than it sounds — the promotion gates in train_ctr.py stop a bad model from
-# shipping, but nothing stops a model that passes gates and behaves badly on
-# real traffic.
+# Promotion is a single PUT of that pointer, and S3 is read-after-write
+# consistent on it, so every replica sees either the old version or the new one.
+# They converge within one MODEL_REFRESH_SECONDS window without coordinating.
+# Rollback is the same PUT with an older version — worth having, since the
+# promotion gates catch a bad model but not one that gates fine and misbehaves
+# on real traffic.
 
 from __future__ import annotations
 
@@ -49,8 +35,7 @@ from ..settings import settings
 
 log = logging.getLogger(__name__)
 
-# The three files that make up an artifact. calibrator.pkl is optional — an
-# uncalibrated model still serves, it just serves worse.
+# calibrator.pkl is optional; an uncalibrated model still serves.
 MODEL_FILE = "model.json"
 CALIBRATOR_FILE = "calibrator.pkl"
 METADATA_FILE = "metadata.json"
@@ -63,9 +48,8 @@ OPTIONAL_FILES = (CALIBRATOR_FILE,)
 @dataclass(frozen=True)
 class Resolved:
     """
-    A local directory holding a complete artifact, plus the token that identifies
-    it. `token` is compared against the last-loaded token to decide whether any
-    work is needed — it is an mtime for local, a model_version for S3.
+    A local directory holding a complete artifact. `token` identifies it for
+    change detection: an mtime for local, a model_version for S3.
     """
     directory: Path
     token: str
@@ -76,8 +60,8 @@ class ArtifactStore(Protocol):
     def resolve(self, current_token: Optional[str]) -> Optional[Resolved]:
         """
         Return the live artifact if it differs from `current_token`, else None.
-        Must not raise on "nothing published yet" — that is a normal cold start,
-        and the gateway serves baseline CTR until a model exists.
+        Returns None rather than raising when nothing is published yet; that is
+        a normal cold start and the gateway serves baseline CTR until then.
         """
         ...
 
@@ -90,11 +74,7 @@ class ArtifactStore(Protocol):
 # ---------------------------------------------------------------------------
 
 class LocalArtifactStore:
-    """
-    The original behaviour: a directory, usually a bind mount, whose
-    metadata.json mtime is the version token. Unchanged so that dev, tests, and
-    docker-compose keep working exactly as before.
-    """
+    """A directory, usually a bind mount, keyed on metadata.json's mtime."""
 
     def __init__(self, directory: str | Path | None = None):
         self.directory = Path(directory or settings.model_dir)
@@ -111,8 +91,7 @@ class LocalArtifactStore:
         try:
             version = str(json.loads(meta_path.read_text()).get("model_version", "unknown"))
         except Exception:
-            # A half-written metadata.json. Do not swap on it; the next refresh
-            # tick will pick up the complete file.
+            # Half-written file; the next refresh tick gets the complete one.
             log.warning("metadata.json at %s is not readable JSON yet", self.directory)
             return None
 
@@ -128,13 +107,12 @@ class LocalArtifactStore:
 
 class S3ArtifactStore:
     """
-    Pointer-based distribution. Downloads into a per-version directory under the
-    cache dir and hands back that directory; the caller loads from local disk as
-    it always has.
+    Downloads the pointed-at version into a per-version directory under the
+    cache dir and returns that directory, so the caller still loads from disk.
 
-    Downloads go to a temp directory and are renamed into place, so a task that
-    dies mid-download leaves no partial version dir that a later boot would
-    mistake for a complete one.
+    Downloads land in a temp dir and are renamed into place: a task that dies
+    mid-download leaves no partial directory for a later boot to mistake for a
+    complete one.
     """
 
     def __init__(
@@ -156,7 +134,7 @@ class S3ArtifactStore:
         self.region = region or settings.aws_region
         self._client = client
 
-    # -- boto3 is imported lazily so the local path never needs it installed --
+    # boto3 is imported lazily so the local path does not need it installed.
 
     @property
     def client(self):
@@ -175,8 +153,8 @@ class S3ArtifactStore:
                 Bucket=self.bucket, Key=self._key(POINTER_FILE)
             )["Body"].read()
         except Exception as e:
-            # NoSuchKey on a fresh bucket is expected. Anything else is worth a
-            # log line, but neither is fatal — we keep serving what we have.
+            # NoSuchKey on a fresh bucket is expected; other errors are not, but
+            # neither is fatal, since we keep serving what is already loaded.
             if type(e).__name__ in {"NoSuchKey", "ClientError"}:
                 log.debug("no model pointer at s3://%s/%s (%s)",
                           self.bucket, self._key(POINTER_FILE), e)
@@ -203,9 +181,8 @@ class S3ArtifactStore:
         if version == current_token:
             return None
 
-        # A version that is on the same value as an already-cached dir does not
-        # need re-downloading — this is the common case on a task restart during
-        # a deploy, and it takes the cold start from seconds to nothing.
+        # Already cached: skip the download. Common on a task restart mid-deploy
+        # and on rollback.
         target = self.cache_dir / version
         if self._is_complete(target):
             log.info("model %s already cached at %s", version, target)
@@ -237,14 +214,12 @@ class S3ArtifactStore:
                 except Exception:
                     log.info("no %s for model %s — serving uncalibrated", name, version)
 
-            # os.replace on a directory is atomic when the target does not exist
-            # and both live on the same filesystem, which is guaranteed here
-            # because staging was created inside cache_dir.
+            # Atomic when the target does not exist and both are on the same
+            # filesystem, which staging being inside cache_dir guarantees.
             try:
                 os.replace(staging, target)
             except OSError:
-                # Another thread or an earlier partial run got there first.
-                # Whatever is at `target` is complete or it is not; check.
+                # Something got there first. Check what it left behind.
                 shutil.rmtree(staging, ignore_errors=True)
                 if not self._is_complete(target):
                     raise
@@ -265,7 +240,7 @@ class S3ArtifactStore:
 # ---------------------------------------------------------------------------
 
 def build_store() -> ArtifactStore:
-    """Pick a store from configuration. Called once, at CtrModel construction."""
+    """Called once, at CtrModel construction."""
     backend = settings.model_artifact_backend.lower()
     if backend == "s3":
         return S3ArtifactStore()

@@ -1,11 +1,9 @@
 # test_auction.py — winner selection, exploration, and serve_propensity.
 #
-# The propensity tests are the point of this file. Everything else here would
-# fail loudly in production; a wrong propensity fails silently, in the training
-# job, weeks later, and the symptom is a model that mysteriously stops improving.
-#
-# The invariant to hold onto: serve_propensity is P(this ad was served), over
-# ALL paths that could have served it. The greedy winner has two such paths.
+# serve_propensity is P(this ad was served), summed over every path that could
+# have served it. The greedy winner has two: the exploit path picks it, and
+# exploration can land on it. Getting that wrong does not fail in production, it
+# fails in the training job weeks later as a model that stops improving.
 
 from __future__ import annotations
 
@@ -40,17 +38,14 @@ def make(ad_id: str, ctr: float, target_cpm: float = 10.0,
 
 
 class ForcedRng:
-    """
-    Drives both decisions in run_auction deterministically: random() decides
-    explore-vs-exploit, choice() decides which ad exploration lands on.
-    """
+    """Drives both decisions in run_auction: whether to explore, and onto what."""
 
     def __init__(self, explore: bool, choice_index: int = 0):
         self._explore = explore
         self._index = choice_index
 
     def random(self) -> float:
-        # Below any positive epsilon when exploring, at 1.0 when not.
+        # Below any positive epsilon, or above any epsilon below 1.
         return 0.0 if self._explore else 1.0
 
     def choice(self, seq):
@@ -72,8 +67,7 @@ class TestWinnerSelection:
         assert result.winner.ad.ad_id == "b"
 
     def test_bid_value_not_ctr_decides(self):
-        # Lower CTR, much higher CPM. bid_value = ctr * target_cpm is what the
-        # sort uses, and it should be: 0.01*50 beats 0.03*10.
+        # bid_value = ctr * target_cpm, so 0.01*50 beats 0.03*10.
         low_ctr_rich = make("rich", 0.01, target_cpm=50.0)   # 0.50
         high_ctr_poor = make("poor", 0.03, target_cpm=10.0)  # 0.30
         result = run_auction([high_ctr_poor, low_ctr_rich], "imp_1", epsilon=0.0)
@@ -114,8 +108,8 @@ class TestExploration:
             assert run_auction(ads, "imp_1", epsilon=1.0).is_exploration is True
 
     def test_a_single_candidate_never_explores(self):
-        # n > 1 guard. With one ad there is nothing to explore toward, and
-        # "exploration" would just mean charging the floor for no reason.
+        # The n > 1 guard. With one ad, exploring would only mean charging the
+        # floor instead of a second price.
         for _ in range(100):
             result = run_auction([make("solo", 0.02)], "imp_1", epsilon=1.0)
             assert result.is_exploration is False
@@ -129,8 +123,7 @@ class TestExploration:
         assert result.winner.ad.ad_id == "a"
 
     def test_exploration_charges_the_floor_not_a_second_price(self):
-        # An exploration impression was not won on merit, so there is no
-        # runner-up to price against. Charging the floor is the honest answer.
+        # Nothing was outbid, so there is no runner-up to price against.
         ads = [make("a", 0.01, floor=1.25), make("b", 0.03, floor=0.10)]
         result = run_auction(ads, "imp_1", epsilon=0.5,
                              rng=ForcedRng(explore=True, choice_index=0))
@@ -153,8 +146,8 @@ class TestExploration:
 class TestServePropensity:
 
     def test_greedy_path_propensity(self):
-        # Served by the exploit path: (1-eps) + eps/n, because exploration
-        # could ALSO have picked it.
+        # (1-eps) for the exploit path, plus eps/n because exploration could
+        # have picked it too.
         ads = [make("a", 0.01), make("b", 0.03), make("c", 0.02)]
         result = run_auction(ads, "imp_1", epsilon=0.09,
                              rng=ForcedRng(explore=False))
@@ -162,22 +155,23 @@ class TestServePropensity:
 
     def test_explored_loser_propensity_is_epsilon_over_n(self):
         ads = [make("a", 0.01), make("b", 0.03), make("c", 0.02)]
-        # Index 0 is "a", a loser — reachable only via exploration.
+        # Index 0 is "a", a loser, reachable only via exploration.
         result = run_auction(ads, "imp_1", epsilon=0.09,
                              rng=ForcedRng(explore=True, choice_index=0))
         assert result.winner.ad.ad_id == "a"
         assert result.serve_propensity == pytest.approx(0.09 / 3)
 
     def test_exploration_landing_on_the_greedy_winner_includes_the_exploit_term(self):
-        # THE REGRESSION TEST. This is the bug: the exploration branch used to
-        # log eps/n unconditionally, including when rng.choice happened to
-        # return the ad the exploit path would have chosen anyway. That ad's
-        # true serve probability is (1-eps) + eps/n. Logging eps/n inflates its
-        # IPS weight by ~1/eps — at eps=0.08, about 17x — always in favour of
-        # the ad the model already ranked first.
+        # The bug this file was written for. The exploration branch logged
+        # eps/n unconditionally, including when rng.choice returned the ad the
+        # exploit path would have chosen anyway. Its true serve probability is
+        # (1-eps) + eps/n, so eps/n inflates its IPS weight by about 1/eps —
+        # 17x at the default — always favouring the model's existing top pick.
         ads = [make("a", 0.01), make("b", 0.03), make("c", 0.02)]
+        # Derived, not hardcoded: an earlier version of this harness assumed
+        # index 0 and the real winner was index 2.
         greedy_index = max(range(len(ads)), key=lambda i: ads[i].bid_value)
-        assert ads[greedy_index].ad.ad_id == "b"     # derived, never hardcoded
+        assert ads[greedy_index].ad.ad_id == "b"
 
         result = run_auction(ads, "imp_1", epsilon=0.08,
                              rng=ForcedRng(explore=True, choice_index=greedy_index))
@@ -192,9 +186,8 @@ class TestServePropensity:
     @pytest.mark.parametrize("epsilon", [0.01, 0.08, 0.25, 0.5])
     @pytest.mark.parametrize("n", [2, 3, 5, 10])
     def test_propensities_sum_to_one_across_the_candidate_set(self, epsilon, n):
-        # The definitive check. Sum P(served) over every ad; it must be exactly
-        # 1.0, because exactly one ad is served. Any formula error breaks this,
-        # including ones no single-case test would catch.
+        # Exactly one ad is served, so P(served) over the set is 1.0. Catches
+        # formula errors that individual cases can be made to agree with.
         ads = [make(f"ad_{i}", 0.01 * (i + 1)) for i in range(n)]
         greedy_index = max(range(n), key=lambda i: ads[i].bid_value)
 
@@ -215,10 +208,9 @@ class TestServePropensity:
 
     @pytest.mark.parametrize("epsilon", [0.05, 0.20])
     def test_logged_propensity_matches_observed_serve_frequency(self, epsilon):
-        # The empirical version: run the real RNG many times and check that each
-        # ad's observed serve rate matches the propensity the code logged for
-        # it. This catches formula errors AND selection errors at once, and it
-        # is what caught the hardcoded-greedy-index bug in the parity harness.
+        # Real RNG, many trials: each ad's observed serve rate should match the
+        # propensity logged for it. Catches selection bugs as well as formula
+        # ones, since a wrong winner shows up as a frequency mismatch.
         ads = [make("a", 0.01), make("b", 0.03), make("c", 0.02)]
         rng = random.Random(11)
         trials = 60_000
@@ -246,10 +238,9 @@ class TestServePropensity:
             assert 0.0 < p <= 1.0
 
     def test_identical_bid_values_do_not_double_count_the_greedy_term(self):
-        # Two ads tie exactly. Only the one the sort placed at rank 0 is
-        # reachable via the exploit path, so only it gets the (1-eps) term.
-        # An `==` comparison on bid_value instead of `is` on the object would
-        # give both ads the greedy propensity and sum to more than 1.
+        # On a tie, only the ad the sort placed at rank 0 is reachable via the
+        # exploit path. Comparing bid_value with == instead of the object with
+        # `is` would give both the greedy term and sum above 1.
         ads = [make("a", 0.02), make("b", 0.02)]
         assert ads[0].bid_value == ads[1].bid_value
 
@@ -267,16 +258,14 @@ class TestResultShape:
         assert isinstance(run_auction([make("a", 0.02)], "imp_1"), AuctionResult)
 
     def test_carries_the_model_version(self):
-        # Without this the training job cannot cut on model_version, which is
-        # exactly how you quarantine rows logged under a bad propensity.
+        # How the training job quarantines rows logged under a bad propensity.
         result = run_auction([make("a", 0.02)], "imp_1")
         assert isinstance(result.model_version, str)
         assert result.model_version
 
     def test_winner_keeps_its_feature_vector(self):
-        # build_impression_event logs this verbatim. If it were dropped here,
-        # the training job would have to recompute features and train/serve
-        # skew becomes possible.
+        # build_impression_event logs it verbatim. Dropping it would force the
+        # training job to recompute, which is where train/serve skew starts.
         ads = [make("a", 0.01), make("b", 0.03)]
         result = run_auction(ads, "imp_1", epsilon=0.0)
         assert result.winner.features == [0.0]
