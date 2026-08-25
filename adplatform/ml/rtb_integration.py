@@ -94,13 +94,34 @@ def run_auction(
             model_version=ctr_model.model_version,
         )
 
+    # Ranked FIRST, before the exploration branch, because the exploration
+    # branch needs to know who the greedy winner would have been. Sorting only
+    # inside the exploit path is what caused the propensity bug below.
+    ranked = sorted(scored_ads, key=lambda s: s.bid_value, reverse=True)
+    greedy_winner = ranked[0]
+
     if n > 1 and rng.random() < epsilon:
         winner = rng.choice(scored_ads)
+        # PROPENSITY. This is the probability that THIS ad was served, over both
+        # paths that could have served it — and the greedy winner is reachable
+        # by both. It is served with probability (1-eps) by the exploit path
+        # PLUS eps/n by this one. Logging only eps/n for it inflates its IPS
+        # weight by roughly 1/eps — at eps=0.08 that is ~17x, and always in
+        # favour of the ad the model already preferred. Exploration exists
+        # precisely to stop the model reinforcing its own ranking, and getting
+        # this wrong makes it do the opposite, silently, forever.
+        #
+        # Identity, not equality: two ads can tie on bid_value, and only the one
+        # sort actually placed at rank 0 is reachable via the exploit path.
+        propensity = (
+            (1.0 - epsilon) + (epsilon / n)
+            if winner is greedy_winner
+            else epsilon / n
+        )
         return _result(winner, min(winner.ad.floor_price, winner.ad.target_cpm),
-                       True, epsilon / n)
+                       True, propensity)
 
-    ranked = sorted(scored_ads, key=lambda s: s.bid_value, reverse=True)
-    winner = ranked[0]
+    winner = greedy_winner
 
     if len(ranked) >= 2:
         cpm = clearing_cpm(winner, ranked[1].bid_value)
