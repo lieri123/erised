@@ -27,9 +27,7 @@ const MIN_DIVISOR_CTR: f64 = 1e-9;
 /// The subset of an `Ad` the auction actually reads.
 ///
 /// Targeting fields, creative HTML and budget live upstream in the eligibility
-/// filter and never reach here. Keeping this struct narrow means the auction
-/// cannot accidentally start depending on something the training-time
-/// reconstruction of an ad would not have.
+/// filter and never reach here. 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ad {
     pub ad_id: String,

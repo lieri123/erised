@@ -11,6 +11,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 
@@ -98,6 +99,59 @@ async def preflight(client: httpx.AsyncClient, base: str) -> dict:
     return health
 
 
+# Latency
+
+def new_stats() -> dict:
+    """One place that knows the shape, so the probe loop and the real run cannot
+    drift apart. They did: adding latency_ms to one and not the other is a
+    KeyError 30 requests into a run that already spun up the whole stack."""
+    return {"filled": 0, "no_fill": 0, "errors": 0, "clicks": 0,
+            "click_403": 0, "rate_limited": 0, "latency_ms": []}
+
+
+def percentile(ordered: list[float], q: float) -> float:
+    """Nearest-rank, on an already-sorted list. No numpy in the driver, and at
+    20k samples the difference from an interpolating percentile is well under
+    the run-to-run variance."""
+    if not ordered:
+        return float("nan")
+    k = max(1, math.ceil(q / 100.0 * len(ordered)))
+    return ordered[k - 1]
+
+
+def latency_summary(samples: list[float], wall_seconds: float,
+                    concurrency: int) -> dict:
+    ordered = sorted(samples)
+    n = len(ordered)
+    if not n:
+        return {}
+    return {
+        "responses": n,
+        "concurrency": concurrency,
+        "wall_seconds": round(wall_seconds, 2),
+        "throughput_rps": round(n / max(wall_seconds, 1e-3), 1),
+        "p50_ms": round(percentile(ordered, 50), 2),
+        "p95_ms": round(percentile(ordered, 95), 2),
+        "p99_ms": round(percentile(ordered, 99), 2),
+        "max_ms": round(ordered[-1], 2),
+        "mean_ms": round(sum(ordered) / n, 2),
+    }
+
+
+def log_latency(summary: dict) -> None:
+    if not summary:
+        log.warning("no latency samples — every request failed in transport?")
+        return
+    log.info("")
+    log.info("/v1/bid latency, %d responses at concurrency %d",
+             summary["responses"], summary["concurrency"])
+    for label in ("p50", "p95", "p99", "max", "mean"):
+        log.info("  %-5s %8.2f ms", label, summary[f"{label}_ms"])
+    log.info("  %.0f req/s sustained over %.1fs",
+             summary["throughput_rps"], summary["wall_seconds"])
+    log.info("")
+
+
 # Traffic
 
 async def one_request(client, base, key, world, rng, stats) -> dict | None:
@@ -115,12 +169,25 @@ async def one_request(client, base, key, world, rng, stats) -> dict | None:
         "timestamp_ms": int(time.time() * 1000),
     }
 
+    # Timed around the bid POST only. The click GET below is a different
+    # endpoint doing different work, and folding the two together produces a
+    # number that describes neither.
+    t0 = time.perf_counter()
     try:
         r = await client.post(f"{base}/v1/bid", json=body,
                               headers={"X-API-Key": key}, timeout=15)
     except Exception:
+        # No response, so no latency worth recording — a timeout would enter as
+        # a suspiciously round 15000ms and sit on top of p99.
         stats["errors"] += 1
         return None
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    # 429s are rejected by the rate limiter before an auction runs. They are
+    # real responses but they are not the work being measured, and at any
+    # meaningful volume they would drag p50 toward slowapi's overhead.
+    if r.status_code != 429:
+        stats["latency_ms"].append(elapsed_ms)
 
     if r.status_code == 429:
         stats["rate_limited"] += 1
@@ -167,9 +234,8 @@ async def one_request(client, base, key, world, rng, stats) -> dict | None:
 
 
 async def run_traffic(n: int, concurrency: int, base: str, key: str,
-                      world: World, rng: random.Random) -> list[dict]:
-    stats = {"filled": 0, "no_fill": 0, "errors": 0, "clicks": 0,
-             "click_403": 0, "rate_limited": 0}
+                      world: World, rng: random.Random) -> tuple[list[dict], dict]:
+    stats = new_stats()
     results: list[dict] = []
     sem = asyncio.Semaphore(concurrency)
 
@@ -205,6 +271,8 @@ async def run_traffic(n: int, concurrency: int, base: str, key: str,
                     f"environment: block in docker-compose.yml and "
                     f"`docker compose up -d gateway`.")
 
+    wall = time.time() - started
+
     if stats["click_403"]:
         log.error("%d click(s) rejected with 403 — signed URL verification is "
                   "failing; clicks are NOT being recorded", stats["click_403"])
@@ -216,7 +284,10 @@ async def run_traffic(n: int, concurrency: int, base: str, key: str,
              stats["filled"], stats["clicks"],
              100.0 * stats["clicks"] / max(stats["filled"], 1),
              stats["no_fill"], stats["rate_limited"], stats["errors"])
-    return results
+
+    summary = latency_summary(stats["latency_ms"], wall, concurrency)
+    log_latency(summary)
+    return results, summary
 
 
 # Backdated rows for training
@@ -328,6 +399,9 @@ async def main() -> int:
     ap.add_argument("--clickhouse-host", default="localhost")
     ap.add_argument("--clickhouse-port", type=int, default=8123)
     ap.add_argument("--check", action="store_true", help="readiness check only")
+    ap.add_argument("--latency-out", default=None,
+                    help="write the latency summary as JSON, e.g. "
+                         "docs/loadtest/run.json")
     args = ap.parse_args()
 
     import os
@@ -355,16 +429,26 @@ async def main() -> int:
         for _ in range(30):
             r = await one_request(c, args.base_url, key,
                                   World([], random.Random(1)), rng,
-                                  {"filled": 0, "no_fill": 0, "errors": 0,
-                                   "clicks": 0, "click_403": 0,
-                                   "rate_limited": 0})
+                                  new_stats())
             if r:
                 probe.append(r["ad_id"])
     world = World(sorted(set(probe)) or ["unknown"], random.Random(RNG_SEED))
     log.info("assigned latent quality to %d ads", len(world.ad_quality))
 
-    rows = await run_traffic(args.impressions, args.concurrency,
-                             args.base_url, key, world, rng)
+    rows, latency = await run_traffic(args.impressions, args.concurrency,
+                                      args.base_url, key, world, rng)
+
+    if args.latency_out and latency:
+        import json
+        out = Path(args.latency_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "base_url": args.base_url,
+            "requested_impressions": args.impressions,
+            **latency,
+        }, indent=2))
+        log.info("latency summary written to %s", out)
 
     if args.no_backdate:
         log.info("--no-backdate: %d rows went through the gateway only. Wait 2h "

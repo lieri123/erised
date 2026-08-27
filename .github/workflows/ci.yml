@@ -68,3 +68,51 @@ jobs:
           load: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  parity:
+    name: rust core + differential parity
+    runs-on: ubuntu-latest
+
+    env:
+      API_KEY_PEPPER: ci-dummy-pepper
+      ADMIN_TOKEN: ci-dummy-admin-token
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: erised-core
+
+      # The Rust unit tests, which nothing else in this workflow runs.
+      - name: cargo test
+        run: cargo test --manifest-path erised-core/Cargo.toml --release
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # `maturin develop` refuses to run outside a virtualenv. A PEP 517 install
+      # of the directory uses the same maturin backend, builds release by
+      # default, and works against the bare setup-python interpreter.
+      - name: Build and install the extension
+        run: pip install ./erised-core
+
+      # The reason this job exists. test_rust_parity.py guards its import with
+      # importorskip so the suite still runs for people without a Rust
+      # toolchain, which means a failed build would show up in the `test` job as
+      # a skip and a green check. Here, a missing module is an error.
+      - name: Extension must be importable
+        run: python -c "import erised_core; print(erised_core.__file__)"
+
+      - name: Differential parity
+        run: pytest tests/test_rust_parity.py -q -rs
