@@ -41,12 +41,55 @@ def _undo_negative_downsampling(p: np.ndarray, keep_rate: float) -> np.ndarray:
     return (keep_rate * p) / (keep_rate * p + 1.0 - p)
 
 
+def _tree_range(booster, best_iteration) -> tuple[int, int] | None:
+    """
+    The slice of trees that training actually gated, as an `iteration_range`.
+
+    `xgb.train(..., early_stopping_rounds=40)` keeps boosting for 40 rounds
+    past the optimum and returns a booster holding ALL of them. train_ctr.py
+    scores the calibration split with `iteration_range=(0, best_iteration + 1)`,
+    so every number promotion depends on -- log loss, AUC, calibration ratio,
+    and the isotonic calibrator's fitted domain -- describes only that prefix.
+    `booster.predict(m)` with no range uses every tree, including the 40 rounds
+    of overfitting after the optimum. Serving that way means the model in
+    production is not the model that passed the gates, and the calibrator is
+    applied to a distribution it was never fit on.
+
+    Returns None when the artifact does not record best_iteration, which keeps
+    pre-existing artifacts loading exactly as before.
+    """
+    if best_iteration is None:
+        return None
+    try:
+        end = int(best_iteration) + 1
+    except (TypeError, ValueError):
+        log.warning("artifact best_iteration=%r is not an integer; "
+                    "serving the whole booster", best_iteration)
+        return None
+    if end < 1:
+        return None
+    # An end past the last tree makes predict() raise, which would turn every
+    # bid into a baseline fallback. Clamp instead.
+    try:
+        n_rounds = int(booster.num_boosted_rounds())
+    except Exception:
+        return (0, end)
+    if end > n_rounds:
+        log.warning("artifact best_iteration=%s exceeds its %d boosted rounds; "
+                    "serving all of them", best_iteration, n_rounds)
+        return (0, n_rounds)
+    return (0, end)
+
+
 @dataclass
 class _Artifact:
     booster: object
     calibrator: object | None
     keep_rate: float
     model_version: str
+    # (0, best_iteration + 1), or None when the artifact does not say. See
+    # _tree_range below for why serving the whole booster is wrong.
+    iteration_range: tuple[int, int] | None = None
 
 
 class CtrModel:
@@ -146,11 +189,14 @@ class CtrModel:
                     calibrator=calibrator,
                     keep_rate=float(meta.get("negative_keep_rate", 1.0)),
                     model_version=str(meta.get("model_version", "unknown")),
+                    iteration_range=_tree_range(booster, meta.get("best_iteration")),
                 )
                 self._loaded_token = resolved.token
-                log.info("loaded CTR model %s from %s (calibrated=%s)",
+                log.info("loaded CTR model %s from %s (calibrated=%s, trees=%s)",
                          self._artifact.model_version, self.store.describe(),
-                         calibrator is not None)
+                         calibrator is not None,
+                         self._artifact.iteration_range[1]
+                         if self._artifact.iteration_range else "all")
                 return True
 
             except Exception:
@@ -201,7 +247,11 @@ class CtrModel:
             import xgboost as xgb
 
             matrix = xgb.DMatrix(np.asarray(vectors, dtype=np.float32))
-            raw = artifact.booster.predict(matrix)
+            if artifact.iteration_range is not None:
+                raw = artifact.booster.predict(
+                    matrix, iteration_range=artifact.iteration_range)
+            else:
+                raw = artifact.booster.predict(matrix)
             corrected = _undo_negative_downsampling(np.asarray(raw), artifact.keep_rate)
 
             if artifact.calibrator is not None:

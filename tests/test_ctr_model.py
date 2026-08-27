@@ -14,14 +14,20 @@ from __future__ import annotations
 import json
 import pickle
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from adplatform.ml.artifacts import LocalArtifactStore
 from adplatform.ml.ctr_model import MAX_CTR, MIN_CTR, CtrModel, _undo_negative_downsampling
-from adplatform.ml.features import FEATURE_VERSION, N_FEATURES, CtrStats, RequestContext
+from adplatform.ml.features import (
+    FEATURE_VERSION,
+    N_FEATURES,
+    CtrStats,
+    RequestContext,
+    extract_features,
+)
 
 import numpy as np
 
@@ -36,11 +42,14 @@ class FakeAd:
     created_at: datetime | None = None
 
 
+REQUEST_TS = datetime(2026, 8, 25, 14, 30, tzinfo=timezone.utc)
+
+
 def ctx() -> RequestContext:
     return RequestContext.build(
         publisher_id="pub_1", placement_id="place_1", device_type="mobile",
         page_keywords=["running"],
-        request_ts=datetime(2026, 8, 25, 14, 30, tzinfo=timezone.utc),
+        request_ts=REQUEST_TS,
     )
 
 
@@ -316,3 +325,156 @@ class TestDownsamplingCorrection:
     def test_handles_the_endpoints_without_dividing_by_zero(self):
         out = _undo_negative_downsampling(np.array([0.0, 1.0]), 0.1)
         assert np.all(np.isfinite(out))
+
+
+class TestServesTheGatedTrees:
+    """
+    The model that serves must be the model that passed the promotion gates.
+
+    train_ctr.py fits with `early_stopping_rounds=40`, which leaves the booster
+    holding 40 rounds of trees PAST the optimum, and then scores the calibration
+    split with `iteration_range=(0, best_iteration + 1)`. Every gate — log loss
+    against the baseline, the [0.85, 1.15] calibration ratio, AUC > 0.55 — and
+    the isotonic calibrator's fitted domain therefore describe only that prefix.
+
+    Serving with a bare `booster.predict(m)` uses every tree instead, so what
+    runs in production is a model nobody measured, differing exactly in the
+    rounds early stopping identified as overfitting. It fails silently: scores
+    stay plausible, gates stay green, and the miscalibration shows up only as
+    bids that are systematically slightly wrong.
+    """
+
+    KEYWORDS = ("running", "cooking", "python", "travel", "finance", "music")
+
+    @classmethod
+    def _corpus(cls, rng, n):
+        """
+        Feature vectors built by extract_features, not sampled uniformly.
+
+        Training on uniform noise and predicting on real vectors puts every
+        prediction outside the training range, where the booster extrapolates
+        to a constant that clips to MAX_CTR — and a constant is equal to itself
+        no matter which trees produced it.
+        """
+        vectors, overlaps = [], []
+        for i in range(n):
+            ad_kw = tuple(rng.choice(cls.KEYWORDS, size=rng.integers(1, 4), replace=False))
+            page_kw = list(rng.choice(cls.KEYWORDS, size=rng.integers(1, 4), replace=False))
+            ad = FakeAd(
+                ad_id=f"ad_{i % 50}",
+                target_cpm=float(rng.uniform(1.0, 12.0)),
+                target_keywords=ad_kw,
+                spent_today_usd=float(rng.uniform(0.0, 90.0)),
+                created_at=REQUEST_TS - timedelta(days=float(rng.uniform(0, 60))),
+            )
+            request_ctx = RequestContext.build(
+                publisher_id="pub_1",
+                placement_id=f"place_{i % 7}",
+                device_type=rng.choice(["mobile", "desktop", "tablet"]),
+                page_keywords=page_kw,
+                request_ts=REQUEST_TS - timedelta(hours=float(rng.uniform(0, 240))),
+            )
+            vectors.append(extract_features(ad, request_ctx, CtrStats()))
+            overlaps.append(len(set(ad_kw) & set(request_ctx.page_keywords)))
+        return np.asarray(vectors, dtype=np.float32), np.asarray(overlaps)
+
+    @classmethod
+    def _booster_past_the_optimum(cls, path: Path):
+        """Train well past the optimum, so best_iteration < total rounds."""
+        import xgboost as xgb
+
+        rng = np.random.default_rng(3)
+        X, overlap = cls._corpus(rng, 4000)
+        # A real but weak signal, at a plausible CTR base rate. A high base rate
+        # would push predictions into the MAX_CTR clip, where the assertions
+        # below hold whichever trees were used.
+        y = (rng.random(len(X)) < 0.01 + 0.06 * np.minimum(overlap, 2)).astype(int)
+
+        booster = xgb.train(
+            {"objective": "binary:logistic", "eval_metric": "logloss",
+             "max_depth": 3, "eta": 0.3},
+            xgb.DMatrix(X[:3000], label=y[:3000]),
+            num_boost_round=60,
+            evals=[(xgb.DMatrix(X[3000:], label=y[3000:]), "valid")],
+            early_stopping_rounds=5,
+            verbose_eval=False,
+        )
+        booster.save_model(str(path))
+        return booster
+
+    def _varied_ads(self, n=8):
+        rng = np.random.default_rng(77)
+        return [
+            FakeAd(
+                ad_id=f"ad_{i}",
+                target_cpm=float(rng.uniform(1.0, 12.0)),
+                target_keywords=tuple(
+                    rng.choice(self.KEYWORDS, size=rng.integers(1, 4), replace=False)),
+                spent_today_usd=float(rng.uniform(0.0, 90.0)),
+                created_at=REQUEST_TS - timedelta(days=float(rng.uniform(0, 60))),
+            )
+            for i in range(n)
+        ]
+
+    def test_predicts_with_only_the_trees_training_measured(self, tmp_path):
+        import xgboost as xgb
+
+        booster = self._booster_past_the_optimum(tmp_path / "model.json")
+        assert booster.best_iteration + 1 < booster.num_boosted_rounds(), (
+            "fixture did not overshoot the optimum, so this test proves nothing"
+        )
+        write_metadata(tmp_path, best_iteration=booster.best_iteration)
+
+        model = CtrModel(artifact_dir=tmp_path)
+        assert model.load() is True
+
+        served, vectors = model.predict_batch(self._varied_ads(), ctx(), CtrStats())
+
+        matrix = xgb.DMatrix(np.asarray(vectors, dtype=np.float32))
+        gated = booster.predict(matrix, iteration_range=(0, booster.best_iteration + 1))
+        every_tree = booster.predict(matrix)
+
+        # Both must sit strictly inside the clip band. Saturated at MAX_CTR the
+        # final equality holds whichever trees were used, and the test silently
+        # stops testing anything.
+        for name, preds in (("gated", gated), ("every_tree", every_tree)):
+            assert MIN_CTR < preds.min() and preds.max() < MAX_CTR, (
+                f"{name} predictions reached the clip band; the fixture no "
+                f"longer distinguishes the two tree counts"
+            )
+        # And the two must actually differ, or the bug would pass unnoticed.
+        assert not np.allclose(gated, every_tree), (
+            "the extra trees changed nothing here; the fixture is too weak"
+        )
+
+        assert np.allclose(served, gated), (
+            "serving path does not match the predictions training gated"
+        )
+
+    def test_artifact_without_best_iteration_still_serves_every_tree(self, tmp_path):
+        """Artifacts predating this fix carry no best_iteration. They must load."""
+        train_tiny_booster(tmp_path / "model.json")
+        write_metadata(tmp_path)   # no best_iteration key
+
+        model = CtrModel(artifact_dir=tmp_path)
+        assert model.load() is True
+        assert model._artifact.iteration_range is None
+
+        ctrs, _ = model.predict_batch([FakeAd()], ctx(), CtrStats())
+        assert MIN_CTR <= ctrs[0] <= MAX_CTR
+
+    def test_best_iteration_past_the_last_tree_is_clamped(self, tmp_path):
+        """
+        xgboost raises when iteration_range runs off the end, and predict_batch
+        catches that and degrades to the baseline — so a nonsense best_iteration
+        would silently disable the model on every bid. Clamp instead.
+        """
+        train_tiny_booster(tmp_path / "model.json")   # 2 rounds
+        write_metadata(tmp_path, best_iteration=500)
+
+        model = CtrModel(artifact_dir=tmp_path)
+        assert model.load() is True
+        assert model._artifact.iteration_range == (0, 2)
+
+        ctrs, _ = model.predict_batch([FakeAd()], ctx(), CtrStats())
+        assert MIN_CTR <= ctrs[0] <= MAX_CTR

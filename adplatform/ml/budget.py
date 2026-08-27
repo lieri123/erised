@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from ..settings import settings
@@ -158,7 +159,20 @@ async def budget_reconcile_loop(tracker: BudgetTracker, ch_client,
 
 async def filter_by_budget(ads: list, tracker: BudgetTracker) -> list:
     """
-    Drop ads that have exhausted today's budget.
+    Drop ads that have exhausted today's budget, and stamp today's spend onto
+    the survivors.
+
+    The stamp is not incidental. `spent_today_usd` is what features.py divides
+    by `daily_budget_usd` to build the `budget_pacing` feature, and this is the
+    only place on the serving path that ever learns what a campaign has spent.
+    Leaving it at the 0.0 that inventory._row_to_ad sets means the model trains
+    and serves on a feature that is constant zero in production while its unit
+    tests -- which construct an ad with the field already populated -- pass.
+
+    `replace()` rather than assignment: these Ad objects belong to the shared
+    inventory snapshot, so writing to them would have every concurrent request
+    mutating the same objects and would leave stale spend on them between
+    refreshes.
     """
     if not ads:
         return []
@@ -172,7 +186,8 @@ async def filter_by_budget(ads: list, tracker: BudgetTracker) -> list:
         if not ad.campaign_id:
             log.warning("ad %s has no campaign_id; excluding from auction", ad.ad_id)
             continue
-        if spend.get(ad.campaign_id, 0.0) < ad.daily_budget_usd:
-            kept.append(ad)
+        spent = spend.get(ad.campaign_id, 0.0)
+        if spent < ad.daily_budget_usd:
+            kept.append(replace(ad, spent_today_usd=spent))
 
     return kept
