@@ -28,3 +28,12 @@ data/
 .DS_Store
 .idea/
 .vscode/
+
+# Terraform. State holds the RDS password in plaintext.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example
+crash.log
