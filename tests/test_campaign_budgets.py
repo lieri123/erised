@@ -235,3 +235,82 @@ def test_impression_cost_is_one_thousandth_of_cpm():
     burns a $500 daily budget in about 125 impressions.
     """
     assert budget.impression_cost_usd(13.42) == pytest.approx(0.01342)
+
+
+# --- the spend stamp ------------------------------------------------------
+#
+# `budget_pacing` is one of the 17 features in FEATURE_NAMES, and features.py
+# builds it from `ad.spent_today_usd / ad.daily_budget_usd`. inventory._row_to_ad
+# sets spent_today_usd to 0.0 and defers to filter_by_budget to fill it in --
+# this is the only place on the serving path that ever reads a campaign's spend.
+#
+# When filter_by_budget dropped that value on the floor, budget_pacing was
+# constant 0.0 in production: logged into every impression row, trained on as a
+# dead column, and served as one. Nothing failed. test_features.py passed
+# throughout, because it hands extract_features an ad with the field already
+# populated and never exercises the wiring that populates it.
+
+async def test_surviving_ads_carry_todays_spend():
+    tracker = BudgetTracker(FakeRedis({budget_key("camp_1"): "25.0"}))
+
+    kept = await filter_by_budget([ad("ad_a", "camp_1", 100.0)], tracker)
+
+    assert [a.spent_today_usd for a in kept] == [25.0]
+
+
+async def test_spend_stamp_reaches_the_budget_pacing_feature():
+    """End to end: Redis -> filter_by_budget -> extract_features."""
+    from datetime import datetime, timezone
+
+    from adplatform.ml.features import RequestContext, extract_features, features_to_dict
+
+    tracker = BudgetTracker(FakeRedis({budget_key("camp_1"): "25.0"}))
+    kept = await filter_by_budget([ad("ad_a", "camp_1", 100.0)], tracker)
+
+    ctx = RequestContext.build(
+        publisher_id="pub_1", placement_id="place_1", device_type="mobile",
+        page_keywords=["python"],
+        request_ts=datetime(2026, 8, 25, 14, 30, tzinfo=timezone.utc),
+    )
+    pacing = features_to_dict(extract_features(kept[0], ctx))["budget_pacing"]
+
+    assert pacing == pytest.approx(0.25), (
+        "budget_pacing is dead — the model trains and serves on a constant"
+    )
+
+
+async def test_each_campaign_gets_its_own_spend():
+    tracker = BudgetTracker(FakeRedis({
+        budget_key("camp_1"): "10.0",
+        budget_key("camp_2"): "70.0",
+    }))
+    ads = [ad("ad_a", "camp_1", 100.0), ad("ad_b", "camp_2", 100.0)]
+
+    kept = await filter_by_budget(ads, tracker)
+
+    assert {a.ad_id: a.spent_today_usd for a in kept} == {"ad_a": 10.0, "ad_b": 70.0}
+
+
+async def test_the_shared_inventory_snapshot_is_not_mutated():
+    """
+    filter_by_budget receives the Ad objects that live in the process-wide
+    inventory snapshot, shared by every concurrent request. Stamping spend onto
+    them in place would have all of them writing to the same objects and would
+    leave stale spend behind between refreshes.
+    """
+    tracker = BudgetTracker(FakeRedis({budget_key("camp_1"): "25.0"}))
+    original = ad("ad_a", "camp_1", 100.0)
+
+    kept = await filter_by_budget([original], tracker)
+
+    assert kept[0] is not original
+    assert original.spent_today_usd == 0.0, "snapshot ad was mutated in place"
+
+
+async def test_a_redis_outage_stamps_zero_rather_than_stale_spend():
+    """Fails open on the filter, and on the feature too: unknown spend is 0.0."""
+    tracker = BudgetTracker(FakeRedis(fail=True))
+
+    kept = await filter_by_budget([ad("ad_a", "camp_1", 100.0)], tracker)
+
+    assert [a.spent_today_usd for a in kept] == [0.0]

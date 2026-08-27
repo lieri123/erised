@@ -86,6 +86,13 @@ Feature vectors are logged at serve time rather than recomputed at train time,
 which is the standard defence against train/serve skew: if the two ever
 disagree, the model learns from inputs it will never see in production.
 
+The same care applies to *which trees* run. Early stopping leaves the booster
+holding rounds past the optimum, and training scores, calibrates, and gates only
+the `best_iteration` prefix — so serving records that prefix in `metadata.json`
+and predicts with it. Serving the whole booster would put a model in production
+that nothing ever measured, differing precisely in the rounds early stopping
+identified as overfitting.
+
 ---
 
 ## Quickstart
@@ -180,9 +187,13 @@ whether the expiry or the signature failed tells them which half to work on.
 
 ```bash
 pip install -r requirements.txt
-pytest -q                         # 52 tests
+pytest -q                         # 204 tests
 python -m scripts.check_imports   # every module must import
 ```
+
+The eight tests in `tests/test_rust_parity.py` need the Rust extension
+(`pip install ./erised-core`) and skip without it. CI's `parity` job builds it
+and fails if the module is missing, so the skip cannot go green unnoticed.
 
 CI runs both on 3.11 and 3.12 plus a Docker build. `check_imports` exists
 because a cleanup commit once deleted a `from dataclasses import ...` while
