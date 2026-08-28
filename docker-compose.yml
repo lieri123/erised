@@ -158,6 +158,15 @@ services:
       dockerfile: Dockerfile
     command: ["python", "-m", "scripts.bootstrap"]
     restart: "no"
+    # The same models mount the gateway has. Without it, `docker compose run
+    # --rm bootstrap python -m adplatform.ml.train_ctr --out /app/models`
+    # trains a model, runs the promotion gates, writes the versioned directory
+    # and swaps models/current -- all inside a container that --rm then
+    # deletes. The gateway, which mounts ./models from the host, sees nothing,
+    # and /health reports "baseline" forever with no error anywhere to explain
+    # why.
+    volumes:
+      - ./models:/app/models
     environment: &app_env
       ENV: development
       LOG_LEVEL: INFO

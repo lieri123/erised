@@ -187,7 +187,7 @@ whether the expiry or the signature failed tells them which half to work on.
 
 ```bash
 pip install -r requirements.txt
-pytest -q                         # 244 tests
+pytest -q                         # 249 tests
 python -m scripts.check_imports   # every module must import
 ```
 

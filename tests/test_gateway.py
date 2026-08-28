@@ -623,3 +623,59 @@ class TestHealth:
 
     async def test_health_needs_no_key(self, client):
         assert (await client.get("/health")).status_code == 200
+
+
+# --- the documented contract -----------------------------------------------
+
+class TestBidIsDocumented:
+    """
+    /v1/bid is the endpoint publishers integrate against, and for a long time
+    it was the one endpoint with no response schema at all: WinResponse and
+    NoFillResponse were defined and never referenced, and the handler returned
+    a bare JSONResponse, so /docs described the request and said nothing about
+    what comes back.
+
+    Declaring response_model is only half of it. FastAPI skips response-model
+    validation entirely when a handler returns a Response object, so leaving
+    the JSONResponse in place would have published a schema that nothing
+    enforced — free to drift from reality with no test able to notice. These
+    check both halves: the schema is published, AND the responses actually
+    conform to it.
+    """
+
+    def test_openapi_documents_both_outcomes(self):
+        schema = gateway.app.openapi()
+        node = (schema["paths"]["/v1/bid"]["post"]["responses"]["200"]
+                ["content"]["application/json"]["schema"])
+
+        refs = {opt["$ref"].rsplit("/", 1)[-1] for opt in node["anyOf"]}
+        assert refs == {"WinResponse", "NoFillResponse"}
+
+    def test_win_price_is_documented_as_a_cpm(self):
+        """
+        The field most likely to be misread. win_price is dollars per THOUSAND
+        impressions; an integrator who treats it as the cost of one impression
+        is out by 1000x, which is the same confusion budget.py carries a header
+        comment about.
+        """
+        schema = gateway.app.openapi()
+        win = schema["components"]["schemas"]["WinResponse"]
+        assert "CPM" in win["properties"]["win_price"]["description"]
+
+    async def test_a_win_conforms_to_the_published_schema(self, client):
+        r = await client.post("/v1/bid", json=bid_body(), headers=pub_headers())
+        assert r.status_code == 200
+        # Raises ValidationError if the handler and the schema have drifted.
+        gateway.WinResponse.model_validate(r.json())
+
+    async def test_a_no_fill_conforms_to_the_published_schema(self, client):
+        inventory._ads = []
+        r = await client.post("/v1/bid", json=bid_body(), headers=pub_headers())
+        assert r.status_code == 200
+        assert gateway.NoFillResponse.model_validate(r.json()).message == "no_fill"
+
+    async def test_the_impression_id_header_survived_the_change(self, client):
+        """Returning a model instead of a JSONResponse means the header now
+        comes from an injected Response. Easy to drop silently."""
+        r = await client.post("/v1/bid", json=bid_body(), headers=pub_headers())
+        assert r.headers["X-Impression-Id"] == r.json()["impression_id"]

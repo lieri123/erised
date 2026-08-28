@@ -1,4 +1,4 @@
-.PHONY: preflight up down logs verify seed reset bootstrap ps shell-ch shell-pg train
+.PHONY: preflight up down logs verify seed reset bootstrap ps shell-ch shell-pg train publish model-status
 
 preflight:         ## check docker, ports and image tags BEFORE starting
 	./scripts/preflight.sh
@@ -37,7 +37,7 @@ shell-pg:
 	docker compose exec postgres psql -U adplatform -d adplatform
 
 train:             ## train a CTR model from ClickHouse into models/
-	docker compose run --rm bootstrap python -m adplatform.ml.train_ctr --days 7 --out /app/models
+	docker compose run --rm bootstrap python -m adplatform.ml.train_ctr --days 30 --out /app/models
 
 publish:           ## upload models/current to S3 and flip the pointer
 	python -m scripts.publish_model models/current

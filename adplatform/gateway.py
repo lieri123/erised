@@ -20,7 +20,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
@@ -336,10 +336,16 @@ async def log_requests(request: Request, call_next):
 # POST /v1/bid
 
 @app.post("/v1/bid", tags=["Serving"],
-          summary="Run a real-time auction and return a winning ad")
+          summary="Run a real-time auction and return a winning ad",
+          response_model=Union[WinResponse, NoFillResponse],
+          # Both outcomes are 200: a no-fill is an ordinary auction result, not
+          # an error, and a 4xx would have publisher ad tags reporting failures
+          # for an empty candidate set.
+          responses={200: {"description": "A winning creative, or a no-fill"}})
 @limiter.limit(settings.bid_rate_limit)
 async def bid(
     request: Request,
+    response: Response,
     bid_request: BidRequest,
     publisher: Publisher = Depends(require_publisher),
 ):
@@ -387,8 +393,7 @@ async def bid(
         log.info("no_fill | publisher=%s | %sms", publisher_id, latency_ms)
         spawn(publish_event("impressions", {**base_event, "filled": False}),
               name="nofill-event")
-        return JSONResponse(status_code=200, content={
-            "impression_id": impression_id, "message": "no_fill"})
+        return NoFillResponse(impression_id=impression_id)
 
     winner = result.winner
     log.info(
@@ -426,15 +431,14 @@ async def bid(
     ad_markup = winner.ad.creative_html.replace(
         "{{CLICK_URL}}", build_click_url(impression_id))
 
-    response = JSONResponse(content={
-        "impression_id": impression_id,
-        "ad_id":         winner.ad.ad_id,
-        "ad_markup":     ad_markup,
-        "win_price":     result.win_price,
-        "predicted_ctr": winner.predicted_ctr,
-    })
     response.headers["X-Impression-Id"] = impression_id
-    return response
+    return WinResponse(
+        impression_id=impression_id,
+        ad_id=winner.ad.ad_id,
+        ad_markup=ad_markup,
+        win_price=result.win_price,
+        predicted_ctr=winner.predicted_ctr,
+    )
 
 
 # GET /v1/click
