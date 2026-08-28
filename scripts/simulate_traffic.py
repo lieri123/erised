@@ -106,7 +106,8 @@ def new_stats() -> dict:
     drift apart. They did: adding latency_ms to one and not the other is a
     KeyError 30 requests into a run that already spun up the whole stack."""
     return {"filled": 0, "no_fill": 0, "errors": 0, "clicks": 0,
-            "click_403": 0, "rate_limited": 0, "latency_ms": []}
+            "click_403": 0, "click_unreachable": 0, "click_bad_url": None,
+            "rate_limited": 0, "latency_ms": []}
 
 
 def percentile(ordered: list[float], q: float) -> float:
@@ -218,7 +219,15 @@ async def one_request(client, base, key, world, rng, stats) -> dict | None:
                 if cr.status_code == 403:
                     stats["click_403"] += 1
             except Exception:
-                stats["errors"] += 1
+                # Counted apart from `errors`, which otherwise buries this in
+                # the bid-failure total and makes it read as noise. The usual
+                # cause is PUBLIC_BASE_URL naming a host the simulator cannot
+                # reach: run inside the compose network and the default
+                # `localhost` is the simulator's own container, so every click
+                # GET is refused and /v1/click is never exercised at all.
+                stats["click_unreachable"] += 1
+                if stats["click_bad_url"] is None:
+                    stats["click_bad_url"] = m.group(1)
 
     return {
         "impression_id": bid["impression_id"],
@@ -276,14 +285,23 @@ async def run_traffic(n: int, concurrency: int, base: str, key: str,
     if stats["click_403"]:
         log.error("%d click(s) rejected with 403 — signed URL verification is "
                   "failing; clicks are NOT being recorded", stats["click_403"])
+    if stats["click_unreachable"]:
+        log.error("%d click URL(s) unreachable — /v1/click was never exercised. "
+                  "The gateway stamps PUBLIC_BASE_URL into every creative; from "
+                  "wherever this simulator runs, that host has to resolve to the "
+                  "gateway. Inside the compose network it must be "
+                  "http://gateway:8000, because localhost is this container. "
+                  "First failing URL: %s",
+                  stats["click_unreachable"], stats["click_bad_url"])
     if stats["filled"] == 0:
         raise SystemExit("no bids filled — check budgets and inventory")
 
     log.info("traffic done: %d filled, %d clicks (%.2f%% raw CTR), %d no-fill, "
-             "%d rate-limited, %d errors",
+             "%d rate-limited, %d errors, %d unreachable click URLs",
              stats["filled"], stats["clicks"],
              100.0 * stats["clicks"] / max(stats["filled"], 1),
-             stats["no_fill"], stats["rate_limited"], stats["errors"])
+             stats["no_fill"], stats["rate_limited"], stats["errors"],
+             stats["click_unreachable"])
 
     summary = latency_summary(stats["latency_ms"], wall, concurrency)
     log_latency(summary)
@@ -291,6 +309,15 @@ async def run_traffic(n: int, concurrency: int, base: str, key: str,
 
 
 # Backdated rows for training
+
+# The simulator has no budget model: it writes rows straight to ClickHouse and
+# never consults Redis, so it cannot know what a campaign has spent. A constant
+# is the honest stand-in — inventing variance here would teach the model
+# structure that does not exist. It does mean budget_pacing carries no signal in
+# simulated data, unlike the serving path, where filter_by_budget stamps the
+# real figure onto every eligible ad.
+NOMINAL_BUDGET_PACING = 0.1
+
 
 def feature_vector(row: dict, ts: datetime, ad_stats: dict) -> list[float]:
     """
@@ -320,7 +347,7 @@ def feature_vector(row: dict, ts: datetime, ad_stats: dict) -> list[float]:
         (clicks + 1.0) / (seen + 100.0),          # pair_ctr_prior
         math.log1p(seen),                          # pair_impressions_log
         float((datetime.now(timezone.utc) - ts).days % 90),
-        0.1,                                       # budget_pacing
+        NOMINAL_BUDGET_PACING,                     # budget_pacing
     ]
 
 

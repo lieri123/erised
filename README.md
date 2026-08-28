@@ -187,7 +187,7 @@ whether the expiry or the signature failed tells them which half to work on.
 
 ```bash
 pip install -r requirements.txt
-pytest -q                         # 249 tests
+pytest -q                         # 256 tests
 python -m scripts.check_imports   # every module must import
 ```
 
@@ -206,6 +206,12 @@ make seed      make verify     make train
 make logs      make shell-pg   make shell-ch
 ```
 
+`make train` writes into `./models`, which both the gateway and the bootstrap
+job bind-mount. The image runs as uid 10001, and a bind mount takes the host
+directory's ownership rather than the image's — so on a Linux host `./models`
+has to be writable by that uid. Docker Desktop on macOS and Windows papers over
+this and needs nothing.
+
 ---
 
 ## Scope
@@ -219,12 +225,23 @@ Deliberately not built:
 
 - **Billing.** `cost_usd` is computed and logged. Nothing invoices it, charges a
   card, or handles prepaid balances or disputes. Budgets are enforced in Redis;
-  money is not.
+  money is not. Reconciliation corrects a spend counter upward only — a lower
+  total from ClickHouse is the shape a Kafka outage makes, not evidence of an
+  overcount, and lowering the counter would hand back every dropped
+  impression's budget. Reconciling from the durable copy in Postgres instead
+  would need a schema change: `impressions` stores `ad_id`, and budgets are
+  per campaign.
 - **Invalid traffic detection.** No bot filtering, click-fraud detection, IP or
   UA reputation, or viewability measurement.
-- **Creative sandboxing.** `creative_html` is injected into publisher pages
-  verbatim, which is arbitrary JavaScript on someone else's domain. A real
-  deployment needs moderation and an iframe sandbox.
+- **Creative moderation.** The ad tag already sandboxes: `static/adtag.js`
+  renders every creative in an iframe with `allow-scripts` and
+  `allow-same-origin` deliberately withheld, so advertiser markup cannot reach
+  the publisher's origin. What is missing is everything *before* that.
+  `creative_html` is stored and served unsanitised and unreviewed, and
+  `/v1/bid` returns it as `ad_markup` to a publisher who is free to ignore the
+  tag and assign it to `innerHTML`. The sandbox is defence in depth against a
+  creative that turns malicious after review; it is not a substitute for the
+  review, and it protects nobody who does not use the tag.
 - **Human auth and dashboards.** API keys and a shared admin token are enough
   for machines, not for people.
 - **Privacy compliance.** `user_id`, `page_url`, and device data are stored with

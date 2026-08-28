@@ -278,6 +278,15 @@ class Settings:
             )
         if self.model_artifact_backend.lower() == "s3" and not self.model_s3_bucket:
             problems.append("MODEL_ARTIFACT_BACKEND=s3 but MODEL_S3_BUCKET is empty")
+        if self.dev_origins:
+            problems.append(
+                "DEV_ORIGINS is non-empty in production ("
+                + ", ".join(self.dev_origins)
+                + ") — cors.py re-adds these to the allowed set on every "
+                "refresh, so a page served from any of them can read "
+                "authenticated responses from a browser. Set DEV_ORIGINS= "
+                "(empty) in production."
+            )
         if self.kafka_security_protocol.startswith("SASL") and not self.kafka_sasl_username:
             problems.append(
                 f"KAFKA_SECURITY_PROTOCOL={self.kafka_security_protocol} but "

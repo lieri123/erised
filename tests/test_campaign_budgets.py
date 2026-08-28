@@ -196,14 +196,73 @@ async def test_reconcile_writes_campaign_keys():
     assert "GROUP BY campaign_id" in ch.query_text
 
 
-async def test_reconcile_overwrites_drifted_values():
-    """Redis is a cache; the impression log is the source of truth."""
-    redis = FakeRedis({budget_key("camp_1", DAY): "999.0"})
+async def test_reconcile_corrects_a_counter_upward():
+    """
+    What reconciliation is actually for. record_spend is fire-and-forget, so a
+    crash between the auction and the increment loses it; the impression log
+    still has the row, and reconcile puts the money back.
+    """
+    redis = FakeRedis({budget_key("camp_1", DAY): "5.0"})
     tracker = BudgetTracker(redis)
 
     await tracker.reconcile(FakeCH([("camp_1", 12.5)]), day=DAY)
 
     assert redis.store[budget_key("camp_1", DAY)] == "12.5"
+
+
+async def test_reconcile_refuses_to_lower_a_counter():
+    """
+    This assertion is the reverse of the one it replaces, on purpose.
+
+    The old contract was "Redis is a cache; the impression log is the source of
+    truth" -- but ad_impressions arrives over Kafka, and publish_event drops
+    events silently when the broker is unreachable. The log is lossy in exactly
+    one direction: it can be missing impressions, never invent them.
+
+    So a lower ClickHouse total is not evidence that Redis overcounted. It is
+    the shape a broker outage makes. Overwriting downward hands the campaign
+    every dropped impression's budget back, and nothing anywhere reports an
+    error, because from Redis's point of view nothing failed.
+    """
+    redis = FakeRedis({budget_key("camp_1", DAY): "999.0"})
+    tracker = BudgetTracker(redis)
+
+    corrected = await tracker.reconcile(FakeCH([("camp_1", 12.5)]), day=DAY)
+
+    assert redis.store[budget_key("camp_1", DAY)] == "999.0"
+    assert corrected["camp_1"] == 999.0, "the caller must see the figure in force"
+
+
+async def test_a_refusal_is_logged_as_a_warning(caplog):
+    """
+    The one symptom of dropped events that reaches an operator. INFO would put
+    it under the per-request log line the gateway emits for every bid.
+    """
+    import logging
+
+    tracker = BudgetTracker(FakeRedis({budget_key("camp_1", DAY): "999.0"}))
+
+    with caplog.at_level(logging.WARNING, logger="adplatform.ml.budget"):
+        await tracker.reconcile(FakeCH([("camp_1", 12.5)]), day=DAY)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("refused to lower" in m for m in messages), messages
+    assert any("999" in m and "12.5" in m for m in messages), (
+        "the warning must carry both figures, or it cannot be acted on"
+    )
+
+
+async def test_float_noise_is_not_treated_as_drift():
+    """
+    INCRBYFLOAT and ClickHouse sum() will not agree to the last bit on the same
+    impressions. A sub-cent difference must not trip the refusal path.
+    """
+    redis = FakeRedis({budget_key("camp_1", DAY): "12.5"})
+    tracker = BudgetTracker(redis)
+
+    await tracker.reconcile(FakeCH([("camp_1", 12.4999)]), day=DAY)
+
+    assert float(redis.store[budget_key("camp_1", DAY)]) == pytest.approx(12.4999)
 
 
 async def test_reconcile_excludes_pre_migration_rows():

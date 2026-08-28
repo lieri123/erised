@@ -84,3 +84,57 @@ def _restore():
     yield
     import adplatform.settings as S
     importlib.reload(S)
+
+
+# --- the production boot gate ----------------------------------------------
+#
+# test_empty_dev_origins_drops_localhost above proves the escape hatch works.
+# These prove something narrower and more useful: that nothing has to remember
+# to use it. validate_for_production runs in the lifespan and aborts boot, so a
+# check that is missing here is a misconfiguration that ships.
+
+def _prod(monkeypatch, **env):
+    env.setdefault("ENV", "production")
+    env.setdefault("API_KEY_PEPPER", "a-real-pepper")
+    env.setdefault("ADMIN_TOKEN", "a-real-token")
+    env.setdefault("CLICKHOUSE_PASSWORD", "a-real-password")
+    env.setdefault("MODEL_ARTIFACT_BACKEND", "s3")
+    env.setdefault("MODEL_S3_BUCKET", "a-bucket")
+    env.setdefault("BOOTSTRAP_API_KEY", None)
+    return reload_settings(monkeypatch, **env)
+
+
+def test_default_dev_origins_block_production_boot(monkeypatch):
+    """
+    settings.py documents the danger — "production can ship with an empty list
+    rather than permanently trusting localhost" — but documenting it is not
+    enforcing it. cors.py re-adds DEV_ORIGINS on every refresh, so shipping the
+    defaults means localhost is a trusted CORS origin for the life of the
+    deployment, and a page there can read authenticated responses.
+    """
+    S = _prod(monkeypatch, DEV_ORIGINS=None)
+
+    problems = S.settings.validate_for_production()
+
+    assert any("DEV_ORIGINS" in p for p in problems), problems
+
+
+def test_empty_dev_origins_pass_production(monkeypatch):
+    S = _prod(monkeypatch, DEV_ORIGINS="")
+    assert S.settings.validate_for_production() == []
+
+
+def test_a_named_origin_is_still_refused(monkeypatch):
+    """
+    The check is "empty", not "no localhost". A real domain belongs in the
+    publishers table, where it can be revoked; hard-coding it in the
+    environment puts it outside the revocation path entirely.
+    """
+    S = _prod(monkeypatch, DEV_ORIGINS="https://staging.example")
+    assert any("DEV_ORIGINS" in p for p in S.settings.validate_for_production())
+
+
+def test_development_is_unaffected(monkeypatch):
+    """A dev box is allowed to run on defaults; the gate is production-only."""
+    S = reload_settings(monkeypatch, ENV="development", DEV_ORIGINS=None)
+    assert S.settings.validate_for_production() == []

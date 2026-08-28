@@ -15,6 +15,10 @@ log = logging.getLogger(__name__)
 
 KEY_TTL_SECONDS = settings.budget_key_ttl_seconds
 
+# Float noise, not real divergence. INCRBYFLOAT and ClickHouse's sum() will not
+# agree to the last bit on the same impressions.
+DRIFT_EPSILON_USD = 0.001
+
 _INCR_SCRIPT = """
 local v = redis.call('INCRBYFLOAT', KEYS[1], ARGV[1])
 if redis.call('TTL', KEYS[1]) < 0 then
@@ -102,7 +106,33 @@ class BudgetTracker:
 
     async def reconcile(self, ch_client, day: str | None = None) -> dict[str, float]:
         """
-        Recompute today's spend from ad_impressions and overwrite Redis.
+        Recompute today's spend from ad_impressions and correct Redis UPWARD.
+
+        Never downward. The comment this method used to carry -- "Redis is a
+        cache; the impression log is the source of truth" -- named the wrong
+        log. ad_impressions arrives over Kafka, and publish_event drops events
+        silently whenever the broker is unreachable (see dropped_count). So
+        ClickHouse is not authoritative, it is lossy in exactly one direction:
+        it can only ever be missing impressions, never inventing them.
+
+        Overwriting unconditionally therefore turns a broker outage into free
+        budget. Every impression dropped while Kafka was down is one the
+        recomputed total does not know about, so reconcile lowers the counter
+        and the campaign gets to spend that much again -- silently, because
+        from Redis's point of view nothing failed.
+
+        Correcting only upward keeps what reconciliation is actually for
+        (record_spend increments are fire-and-forget and a crash between the
+        auction and the increment loses one) while making the failure mode
+        safe: the worst case becomes a campaign that under-delivers slightly
+        and can be topped up, rather than one that over-delivers with no
+        record of why.
+
+        The durable copy is Postgres `impressions`, written by save_impression
+        -- but it stores ad_id, not campaign_id, and budgets are per campaign,
+        so reconciling from it needs a schema change rather than a query
+        change. Worth doing if this ever bills anyone; out of scope while
+        cost_usd is logged and nothing invoices it.
         """
         import asyncio
 
@@ -129,9 +159,26 @@ class BudgetTracker:
             try:
                 previous = await self.redis.get(key)
                 previous = float(previous) if previous else 0.0
-                if abs(previous - spent) > 0.001:
+
+                if spent < previous - DRIFT_EPSILON_USD:
+                    # Redis is ahead of the impression log. That is the shape a
+                    # Kafka outage makes, not the shape an overcount makes, so
+                    # keep the higher number. WARNING not INFO: this is the
+                    # symptom of dropped events, and it should be findable.
+                    log.warning(
+                        "budget reconcile refused to lower campaign=%s "
+                        "redis=%.4f clickhouse=%.4f -- keeping the higher "
+                        "figure; %.4f of spend is missing from ad_impressions, "
+                        "which usually means events were dropped",
+                        campaign_id, previous, spent, previous - spent,
+                    )
+                    corrected[campaign_id] = previous
+                    continue
+
+                if spent > previous + DRIFT_EPSILON_USD:
                     log.info("budget drift campaign=%s redis=%.4f actual=%.4f",
                              campaign_id, previous, spent)
+
                 await self.redis.set(key, spent, ex=KEY_TTL_SECONDS)
                 corrected[campaign_id] = spent
             except Exception:
