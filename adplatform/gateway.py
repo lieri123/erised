@@ -742,8 +742,14 @@ async def admin_create_publisher(body: CreatePublisherRequest):
                                    name="initial"):
         raise HTTPException(status_code=500, detail="Failed to store API key")
 
-    add_key_now(api_key, Publisher(publisher_id=body.publisher_id, key_id=key_id,
+    # owner_id, not publisher_id. Principal.publisher_id is a read-only property
+    # over owner_id, so the keyword form raises TypeError -- here, AFTER the
+    # publisher row and the api_keys row have both been written, and after the
+    # only copy of the plaintext key has been generated. The 500 that follows
+    # means the caller never receives it, and it is stored nowhere else.
+    add_key_now(api_key, Publisher(owner_id=body.publisher_id, key_id=key_id,
                                    key_prefix=key_prefix(api_key),
+                                   owner_type="publisher",
                                    domain=body.domain))
     await add_origin(db._pool, body.domain)
 
@@ -776,8 +782,9 @@ async def admin_create_key(publisher_id: str, name: Optional[str] = None):
                                    key_prefix(api_key), name=name or "rotated"):
         raise HTTPException(status_code=404, detail="Unknown publisher_id")
 
-    add_key_now(api_key, Publisher(publisher_id=publisher_id, key_id=key_id,
-                                   key_prefix=key_prefix(api_key)))
+    add_key_now(api_key, Publisher(owner_id=publisher_id, key_id=key_id,
+                                   key_prefix=key_prefix(api_key),
+                                   owner_type="publisher"))
     return {"key_id": key_id, "api_key": api_key,
             "warning": "Store this key now — it cannot be retrieved again."}
 
