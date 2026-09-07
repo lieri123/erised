@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -42,8 +43,18 @@ async def score_ads(
 ) -> list[ScoredAd]:
     """
     Predict CTR for every eligible ad and convert to a bid value.
+
+    predict_batch is synchronous CPU work — feature extraction in Python,
+    then a DMatrix build and a booster predict. Called directly it holds the
+    event loop for the whole of that, so a single slow request stalls every
+    other connection on the worker and throughput pins at 1/service_time
+    regardless of how many clients are offered. Booster.predict releases the
+    GIL, so handing it to a thread genuinely overlaps; extract_features does
+    not, and stays serialised until it moves to the Rust core.
     """
-    ctrs, vectors = ctr_model.predict_batch(ads, ctx, stats)
+    ctrs, vectors = await asyncio.to_thread(
+        ctr_model.predict_batch, ads, ctx, stats
+    )
     return [
         ScoredAd(
             ad=ad,

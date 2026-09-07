@@ -16,3 +16,4 @@ docker-compose.yml
 Dockerfile
 .dockerignore
 data/
+erised-core/target

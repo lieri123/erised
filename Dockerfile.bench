@@ -1,0 +1,41 @@
+# Builds erised_core and runs scripts/bench_auction.py without needing a Rust
+# toolchain on the host.
+#
+#   docker build -f Dockerfile.bench -t erised-bench .
+#   docker run --rm -v "${PWD}/docs:/app/docs" erised-bench
+#
+# Every arm runs inside this container, so the ratios are sound. The absolute
+# microseconds are inflated by the Docker Desktop VM, which is why the JSON
+# records the platform — quote the ratio, and cite the microseconds as measured
+# inside a container.
+#
+# Source is baked in, same as the gateway image. Rebuild after any change to
+# rtb_integration.py or erised-core/.
+
+FROM rust:1-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+WORKDIR /app
+
+# Dependency layer first so edits to adplatform/ don't reinstall xgboost.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt maturin
+
+COPY . .
+
+RUN maturin develop --release -m erised-core/crates/erised-py/Cargo.toml
+# Fail the build rather than letting the benchmark start and exit at the import.
+RUN python -c "import erised_core; print('erised_core ok')"
+
+CMD ["python", "scripts/bench_auction.py", \
+     "--iterations", "50000", \
+     "--epsilon", "0.08", \
+     "--max-ads", "40", \
+     "--out", "docs/bench/auction.json"]

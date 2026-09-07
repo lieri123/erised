@@ -1,0 +1,14 @@
+{
+  "captured_at": "2026-09-02T22:27:29.245458+00:00",
+  "base_url": "http://localhost:8000",
+  "requested_impressions": 20000,
+  "responses": 20000,
+  "concurrency": 24,
+  "wall_seconds": 529.52,
+  "throughput_rps": 37.8,
+  "p50_ms": 581.61,
+  "p95_ms": 908.94,
+  "p99_ms": 1065.29,
+  "max_ms": 1513.43,
+  "mean_ms": 595.34
+}

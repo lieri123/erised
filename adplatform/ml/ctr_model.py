@@ -177,6 +177,12 @@ class CtrModel:
 
                 booster = xgb.Booster()
                 booster.load_model(str(directory / MODEL_FILE))
+                # Serving predicts a handful of rows at a time. XGBoost's
+                # default nthread is the core count, so the thread fan-out
+                # costs more than the work it parallelises, and with several
+                # uvicorn workers the pools fight each other for cores.
+                # Training sets its own nthread and is unaffected by this.
+                booster.set_param({"nthread": 1})
 
                 calibrator = None
                 cal_path = directory / CALIBRATOR_FILE

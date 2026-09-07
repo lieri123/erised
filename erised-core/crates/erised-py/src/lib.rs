@@ -143,6 +143,30 @@ fn auction(
     )
 }
 
+/// Extract `candidates` across the FFI boundary and throw the result away.
+///
+/// Exists only so `scripts/bench_auction.py` can attribute the Rust arm's cost
+/// between the boundary and the auction itself. `auction` does this extraction
+/// and then runs the auction; timing this alone and subtracting gives the
+/// algorithm cost without the marshalling, which is what the auction would cost
+/// if the inventory snapshot lived on the Rust side and the boundary carried ad
+/// ids instead of ad tuples.
+///
+/// The extraction must stay character-for-character the same as the loop in
+/// `auction`, or the subtraction measures the difference between two loops
+/// rather than the marshalling. `black_box` keeps the optimiser from noticing
+/// the result is unused and deleting the work.
+#[pyfunction]
+fn marshal_only(candidates: &Bound<'_, PyList>) -> PyResult<usize> {
+    let mut rows = Vec::with_capacity(candidates.len());
+    for item in candidates.iter() {
+        let row: (String, f64, f64, f64) = item.extract()?;
+        rows.push(row);
+    }
+    let rows = std::hint::black_box(rows);
+    Ok(rows.len())
+}
+
 #[pymodule]
 fn erised_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAuctionResult>()?;
@@ -150,6 +174,7 @@ fn erised_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bid_value, m)?)?;
     m.add_function(wrap_pyfunction!(clearing_price, m)?)?;
     m.add_function(wrap_pyfunction!(auction, m)?)?;
+    m.add_function(wrap_pyfunction!(marshal_only, m)?)?;
     m.add("PRICE_TICK_CPM", erised_auction::PRICE_TICK_CPM)?;
     Ok(())
 }

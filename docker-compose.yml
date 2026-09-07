@@ -207,6 +207,10 @@ services:
       - --host=0.0.0.0
       - --port=8000
       - --proxy-headers
+      # One worker serialises every bid behind a single event loop. Override
+      # with GATEWAY_WORKERS in .env. Note this is a local-compose knob only:
+      # on Fargate the equivalent lever is task count behind the ALB.
+      - --workers=${GATEWAY_WORKERS:-4}
     environment: *app_env
     ports:
       - "8000:8000"
