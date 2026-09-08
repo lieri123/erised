@@ -14,12 +14,14 @@ import numpy as np
 from ..settings import settings
 from .artifacts import (
     CALIBRATOR_FILE,
+    EMBEDDING_FILE,
     METADATA_FILE,
     MODEL_FILE,
     ArtifactStore,
     LocalArtifactStore,
     build_store,
 )
+from .embeddings import EmbeddingTable
 from .features import (
     FEATURE_VERSION,
     N_FEATURES,
@@ -90,6 +92,10 @@ class _Artifact:
     # (0, best_iteration + 1), or None when the artifact does not say. See
     # _tree_range below for why serving the whole booster is wrong.
     iteration_range: tuple[int, int] | None = None
+    # The table this booster was trained against, or None for a model trained
+    # without one. Held in the same object as the booster so a mid-request
+    # reload cannot pair one version's trees with another's vectors.
+    embeddings: EmbeddingTable | None = None
 
 
 class CtrModel:
@@ -190,19 +196,40 @@ class CtrModel:
                     with cal_path.open("rb") as fh:
                         calibrator = pickle.load(fh)
 
+                embeddings = None
+                emb_path = directory / EMBEDDING_FILE
+                if emb_path.exists():
+                    embeddings = EmbeddingTable.load(emb_path)
+                elif meta.get("uses_embeddings"):
+                    # Six of the twenty-three columns this booster was trained
+                    # on come out of that table. Without it every request would
+                    # score the neutral block, feeding constants into splits fit
+                    # on real values. That is a different model, not a degraded
+                    # one. Refuse it and keep serving what is already live.
+                    log.error(
+                        "refusing model %s: metadata declares embeddings but "
+                        "%s is missing from %s",
+                        meta.get("model_version"), EMBEDDING_FILE, directory,
+                    )
+                    self._loaded_token = resolved.token
+                    return False
+
                 self._artifact = _Artifact(
                     booster=booster,
                     calibrator=calibrator,
                     keep_rate=float(meta.get("negative_keep_rate", 1.0)),
                     model_version=str(meta.get("model_version", "unknown")),
                     iteration_range=_tree_range(booster, meta.get("best_iteration")),
+                    embeddings=embeddings,
                 )
                 self._loaded_token = resolved.token
-                log.info("loaded CTR model %s from %s (calibrated=%s, trees=%s)",
+                log.info("loaded CTR model %s from %s (calibrated=%s, trees=%s, "
+                         "embeddings=%s)",
                          self._artifact.model_version, self.store.describe(),
                          calibrator is not None,
                          self._artifact.iteration_range[1]
-                         if self._artifact.iteration_range else "all")
+                         if self._artifact.iteration_range else "all",
+                         embeddings.describe() if embeddings else "none")
                 return True
 
             except Exception:
@@ -214,10 +241,15 @@ class CtrModel:
 
     def status(self) -> dict:
         """For /health. Cheap, no I/O."""
+        artifact = self._artifact
         return {
             "trained": self.is_trained,
             "model_version": self.model_version,
             "source": self.store.describe(),
+            "embeddings": (
+                artifact.embeddings.describe()
+                if artifact and artifact.embeddings else None
+            ),
         }
 
     # -- inference ----------------------------------------------------------
@@ -234,15 +266,21 @@ class CtrModel:
         Returns (ctrs, feature_vectors). The feature vectors come back so the
         caller can log the winner's exact input — do not recompute them.
         """
-        vectors = [extract_features(ad, ctx, stats) for ad in ads]
+        # Read the reference once, before extracting features. load() rebinds
+        # self._artifact wholesale from a background thread, so a local
+        # reference means a swap landing mid-request cannot pair one model's
+        # booster with another's calibrator, or with another's embedding table.
+        # Extraction reads that table, so it has to come after the pin.
+        artifact = self._artifact
+
+        vectors = [
+            extract_features(
+                ad, ctx, stats, artifact.embeddings if artifact else None
+            )
+            for ad in ads
+        ]
         if not vectors:
             return [], []
-
-        # Read the reference once. load() rebinds self._artifact wholesale from
-        # a background thread, so taking a local reference means a swap that
-        # lands mid-request cannot pair one model's booster with another's
-        # calibrator.
-        artifact = self._artifact
 
         if artifact is None:
             return [

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import httpx
 
+from adplatform.ml.embeddings import NEUTRAL_EMBEDDING_BLOCK
 from adplatform.ml.features import FEATURE_VERSION, N_FEATURES
 from adplatform.settings import settings
 
@@ -36,6 +37,8 @@ KEYWORD_POOL = [
 
 DEVICE_EFFECT = {"mobile": 1.35, "desktop": 0.75, "tablet": 1.0}
 
+PLACEMENT_IDS = [f"plc_{i}" for i in range(1, 7)]
+
 BASE_CTR = 0.02
 
 
@@ -47,24 +50,47 @@ class World:
     drawn from, and what the model is being asked to rediscover from features.
     """
 
-    def __init__(self, ad_ids: list[str], rng: random.Random):
+    LATENT_DIM = 3
+
+    def __init__(self, ad_ids: list[str], placement_ids: list[str],
+                 rng: random.Random):
         self.rng = rng
         self.ad_quality = {
             ad_id: math.exp(rng.gauss(0.0, 0.55)) for ad_id in ad_ids
         }
+        # Ad x placement affinity, generated low-rank: every ad and every
+        # placement gets a hidden taste vector, and the effect is their inner
+        # product. That is the structure the embedding table exists to
+        # rediscover. A full matrix of independent per-pair multipliers would
+        # have nothing to generalise from, and counting impressions per pair
+        # really would be the best any model could do.
+        self.ad_taste = {a: self._vec() for a in ad_ids}
+        self.placement_taste = {p: self._vec() for p in placement_ids}
         # Per-user propensity is INVISIBLE to the model — the irreducible noise
         # that keeps achievable AUC realistic instead of ~1.0.
         self.user_propensity: dict[str, float] = {}
+
+    def _vec(self) -> tuple[float, ...]:
+        return tuple(self.rng.gauss(0.0, 1.0) for _ in range(self.LATENT_DIM))
+
+    def affinity(self, ad_id: str, placement_id: str) -> float:
+        u = self.ad_taste.get(ad_id)
+        v = self.placement_taste.get(placement_id)
+        if u is None or v is None:
+            return 1.0
+        return math.exp(0.35 * sum(a * b for a, b in zip(u, v)))
 
     def propensity(self, user_id: str) -> float:
         if user_id not in self.user_propensity:
             self.user_propensity[user_id] = math.exp(self.rng.gauss(0.0, 0.45))
         return self.user_propensity[user_id]
 
-    def true_ctr(self, ad_id: str, user_id: str, device: str, overlap: int) -> float:
+    def true_ctr(self, ad_id: str, placement_id: str, user_id: str,
+                 device: str, overlap: int) -> float:
         p = (
             BASE_CTR
             * self.ad_quality.get(ad_id, 1.0)
+            * self.affinity(ad_id, placement_id)
             * DEVICE_EFFECT.get(device, 1.0)
             * self.propensity(user_id)
             * (1.0 + 0.45 * min(overlap, 4))     # relevance, saturating
@@ -159,10 +185,11 @@ async def one_request(client, base, key, world, rng, stats) -> dict | None:
     user_id = f"u_{rng.randint(1, 4000)}"
     device = rng.choice(DEVICES)
     keywords = rng.sample(KEYWORD_POOL, k=rng.randint(1, 5))
+    placement_id = rng.choice(PLACEMENT_IDS)
 
     body = {
         "publisher_id": "pub_demo",
-        "placement_id": f"plc_{rng.randint(1, 6)}",
+        "placement_id": placement_id,
         "user_id": user_id,
         "device_type": device,
         "page_url": f"https://demo.localhost/article/{rng.randint(1, 200)}",
@@ -206,7 +233,7 @@ async def one_request(client, base, key, world, rng, stats) -> dict | None:
     stats["filled"] += 1
 
     overlap = len(set(keywords) & set(KEYWORD_POOL[:12]))
-    p = world.true_ctr(bid["ad_id"], user_id, device, overlap)
+    p = world.true_ctr(bid["ad_id"], placement_id, user_id, device, overlap)
     clicked = rng.random() < p
 
     if clicked:
@@ -232,6 +259,7 @@ async def one_request(client, base, key, world, rng, stats) -> dict | None:
     return {
         "impression_id": bid["impression_id"],
         "ad_id": bid["ad_id"],
+        "placement_id": placement_id,
         "device": device,
         "keywords": keywords,
         "user_id": user_id,
@@ -348,6 +376,11 @@ def feature_vector(row: dict, ts: datetime, ad_stats: dict) -> list[float]:
         math.log1p(seen),                          # pair_impressions_log
         float((datetime.now(timezone.utc) - ts).days % 90),
         NOMINAL_BUDGET_PACING,                     # budget_pacing
+        # The learned block as a gateway with no table loaded would log it.
+        # Harmless here because train_ctr.py recomputes every row's block from
+        # the table it is about to ship, so nothing reads these six columns.
+        # The embeddings learn from ad_id and placement_id on the row.
+        *NEUTRAL_EMBEDDING_BLOCK,
     ]
 
 
@@ -371,10 +404,18 @@ def insert_backdated(rows: list[dict], spread_days: float, dsn_host: str,
         ts = now - timedelta(hours=age_hours)
 
         vec = feature_vector(row, ts, ad_stats)
+        if len(vec) != N_FEATURES:
+            # The MV drops rows whose width is wrong for their feature_version
+            # and train_ctr drops the rest, so a whole simulated run would
+            # vanish between here and training without an error anywhere.
+            raise SystemExit(
+                f"feature_vector produced {len(vec)} values, FEATURE_NAMES has "
+                f"{N_FEATURES} — update it alongside features.py"
+            )
         imp_id = row["impression_id"] if _is_uuid(row["impression_id"]) else str(uuid.uuid4())
 
         imp_rows.append([
-            uuid.UUID(imp_id), ts, "pub_demo", "plc_1", row["ad_id"],
+            uuid.UUID(imp_id), ts, "pub_demo", row["placement_id"], row["ad_id"],
             "adv_sim", row["device"], FEATURE_VERSION,
             [float(x) for x in vec], 0.02, 5.0, 5.0, 0, 1.0, "simulated",
             "camp_sim",
@@ -382,7 +423,7 @@ def insert_backdated(rows: list[dict], spread_days: float, dsn_host: str,
 
         if row["clicked"]:
             click_rows.append([uuid.UUID(imp_id), ts + timedelta(seconds=30),
-                               row["ad_id"], "plc_1"])
+                               row["ad_id"], row["placement_id"]])
 
         seen, clicks = ad_stats.get(row["ad_id"], (0, 0))
         ad_stats[row["ad_id"]] = (seen + 1, clicks + (1 if row["clicked"] else 0))
@@ -455,12 +496,14 @@ async def main() -> int:
         probe = []
         for _ in range(30):
             r = await one_request(c, args.base_url, key,
-                                  World([], random.Random(1)), rng,
+                                  World([], PLACEMENT_IDS, random.Random(1)), rng,
                                   new_stats())
             if r:
                 probe.append(r["ad_id"])
-    world = World(sorted(set(probe)) or ["unknown"], random.Random(RNG_SEED))
-    log.info("assigned latent quality to %d ads", len(world.ad_quality))
+    world = World(sorted(set(probe)) or ["unknown"], PLACEMENT_IDS,
+                  random.Random(RNG_SEED))
+    log.info("assigned latent quality to %d ads and ad x placement affinity "
+             "over %d placements", len(world.ad_quality), len(PLACEMENT_IDS))
 
     rows, latency = await run_traffic(args.impressions, args.concurrency,
                                       args.base_url, key, world, rng)

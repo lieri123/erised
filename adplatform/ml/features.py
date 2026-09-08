@@ -1,13 +1,25 @@
 # features.py — the ONLY place features are computed.
- 
+
 from __future__ import annotations
- 
+
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
- 
-FEATURE_VERSION = 2
- 
-FEATURE_NAMES: tuple[str, ...] = (
+
+from .embeddings import (
+    EMBEDDING_BLOCK_SIZE,
+    EMBEDDING_FEATURE_NAMES,
+    NEUTRAL_EMBEDDING_BLOCK,
+    EmbeddingTable,
+)
+
+# 3 added the learned embedding block. The base block below did not change and
+# kept its indexes, which is what lets train_ctr.py go on training from v2
+# impressions. See TRAINABLE_FEATURE_VERSIONS there.
+FEATURE_VERSION = 3
+
+# The hand-written block. Order is load-bearing: these indexes appear in logged
+# vectors going back months, so nothing may be inserted in the middle.
+BASE_FEATURE_NAMES: tuple[str, ...] = (
     "hour_of_day",            # 0-23
     "day_of_week",            # 0=Mon
     "is_weekend",
@@ -27,8 +39,20 @@ FEATURE_NAMES: tuple[str, ...] = (
     "ad_age_days",
     "budget_pacing",          # spent_today / daily_budget, 0.0-1.0+
 )
- 
+
+N_BASE_FEATURES = len(BASE_FEATURE_NAMES)
+
+# Appending rather than interleaving is what keeps a v2 vector a valid prefix
+# of a v3 one.
+FEATURE_NAMES: tuple[str, ...] = BASE_FEATURE_NAMES + EMBEDDING_FEATURE_NAMES
+
 N_FEATURES = len(FEATURE_NAMES)
+
+# Import-time tripwires for the two silent failures here: a neutral placeholder
+# of the wrong width, and a total that no longer adds up. Either one shows up
+# downstream as a model trained on shifted columns.
+assert len(NEUTRAL_EMBEDDING_BLOCK) == EMBEDDING_BLOCK_SIZE
+assert N_FEATURES == N_BASE_FEATURES + EMBEDDING_BLOCK_SIZE
  
  
 @dataclass(frozen=True)
@@ -98,7 +122,22 @@ class CtrStats:
 EMPTY_STATS = CtrStats()
  
  
-def extract_features(ad, ctx: RequestContext, stats: CtrStats = EMPTY_STATS) -> list[float]:
+def extract_features(
+    ad,
+    ctx: RequestContext,
+    stats: CtrStats = EMPTY_STATS,
+    embeddings: EmbeddingTable | None = None,
+) -> list[float]:
+    """
+    The full vector: the hand-written block, then the learned one.
+
+    `embeddings` comes from the loaded artifact and has to be the table that
+    shipped with the booster being scored. A different table, or None when the
+    booster was trained with one, is train/serve skew that nothing downstream
+    can see, since the columns are still plausible floats. ctr_model reads both
+    from one _Artifact reference so they cannot be mismatched, and refuses an
+    artifact whose metadata claims embeddings it did not ship.
+    """
     ts = ctx.request_ts
     hour = float(ts.hour)
     dow = float(ts.weekday())
@@ -142,9 +181,20 @@ def extract_features(ad, ctx: RequestContext, stats: CtrStats = EMPTY_STATS) -> 
         math.log1p(pair_imps),
         age_days,
         pacing,
+        *(
+            embeddings.block(ad.ad_id, ctx.placement_id)
+            if embeddings is not None
+            else NEUTRAL_EMBEDDING_BLOCK
+        ),
     ]
  
  
 def features_to_dict(vec: list[float]) -> dict[str, float]:
     """For debugging and dashboards only. Never use this on the hot path."""
     return dict(zip(FEATURE_NAMES, vec))
+
+
+def split_blocks(vec: list[float]) -> tuple[list[float], list[float]]:
+    """The base and learned halves of a vector. Tests and inspection only."""
+    return vec[:N_BASE_FEATURES], vec[N_BASE_FEATURES:]
+
