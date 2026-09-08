@@ -187,7 +187,7 @@ whether the expiry or the signature failed tells them which half to work on.
 
 ```bash
 pip install -r requirements.txt
-pytest -q                         # 256 tests
+pytest -q                         # 269 tests
 python -m scripts.check_imports   # every module must import
 ```
 
@@ -242,6 +242,13 @@ Deliberately not built:
   tag and assign it to `innerHTML`. The sandbox is defence in depth against a
   creative that turns malicious after review; it is not a substitute for the
   review, and it protects nobody who does not use the tag.
+- **Publisher key exposure.** `adtag.js` carries the publisher's API key in the
+  browser, where it cannot be a secret. Anyone who views source can mint bid
+  requests attributed to that publisher, bounded only by `BID_RATE_LIMIT`. CORS
+  does not help — it is enforced by browsers, and `curl` ignores it. A real
+  exchange has the publisher's own server sign the request, or issues
+  short-lived origin-bound tokens. This is also what makes the missing invalid
+  traffic detection above matter more than it otherwise would.
 - **Human auth and dashboards.** API keys and a shared admin token are enough
   for machines, not for people.
 - **Privacy compliance.** `user_id`, `page_url`, and device data are stored with

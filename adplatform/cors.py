@@ -34,7 +34,30 @@ async def load_origins_from_db(pool) -> int:
               AND domain != ''
         """)
 
-        fresh_domains = {row["domain"] for row in rows}
+        # An Origin header is always scheme://host[:port]. A domain stored
+        # without a scheme therefore matches nothing, ever -- it sits in the
+        # allowed set looking registered while every request from it is
+        # blocked. The admin API rejects these at the door and add_origin
+        # raises on them, but seed and migration scripts write straight to
+        # Postgres and bypass both, so the read path has to refuse them too --
+        # loudly, because the symptom is otherwise just a publisher whose tag
+        # silently does not work.
+        fresh_domains = set()
+        malformed = []
+        for row in rows:
+            domain = (row["domain"] or "").strip()
+            if not domain.startswith(("http://", "https://")):
+                malformed.append(domain)
+                continue
+            fresh_domains.add(domain.rstrip("/"))
+
+        if malformed:
+            log.warning(
+                "%d publisher domain(s) have no scheme and can never match an "
+                "Origin header, so they are not registered: %s. Store them as "
+                "https://example.com, not example.com.",
+                len(malformed), ", ".join(sorted(malformed)),
+            )
 
         REGISTERED_ORIGINS.clear()
         REGISTERED_ORIGINS.update(DEV_ORIGINS)       # always keep dev origins

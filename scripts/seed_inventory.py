@@ -28,7 +28,9 @@ log = logging.getLogger("seed")
 
 PREFIX = "seed_"
 DEMO_PUBLISHER_ID = "pub_demo"
-DEMO_DOMAIN = "demo.localhost"
+# With a scheme. cors.load_origins_from_db compares this against the browser's
+# Origin header, which always carries one.
+DEMO_DOMAIN = "http://demo.localhost"
 
 RNG_SEED = 20260731
 
