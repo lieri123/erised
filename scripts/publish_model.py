@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from adplatform.ml.artifacts import (  # noqa: E402
     CALIBRATOR_FILE,
+    EMBEDDING_FILE,
     METADATA_FILE,
     MODEL_FILE,
     POINTER_FILE,
@@ -41,7 +42,7 @@ from adplatform.ml.artifacts import (  # noqa: E402
 from adplatform.settings import settings  # noqa: E402
 
 REQUIRED = (MODEL_FILE, METADATA_FILE)
-OPTIONAL = (CALIBRATOR_FILE,)
+OPTIONAL = (CALIBRATOR_FILE, EMBEDDING_FILE)
 
 
 def _client(region: str):
@@ -81,6 +82,11 @@ def publish(directory: Path, bucket: str, prefix: str, region: str,
         )
 
     missing = [name for name in REQUIRED if not (directory / name).exists()]
+    if meta.get("uses_embeddings") and not (directory / EMBEDDING_FILE).exists():
+        # Uploading without it publishes a booster whose last six inputs no
+        # replica can compute. They all refuse the artifact and keep serving the
+        # old model, which reads as a promotion that quietly did nothing.
+        missing.append(EMBEDDING_FILE)
     if missing:
         raise SystemExit(f"{directory} is missing {', '.join(missing)}")
 

@@ -32,17 +32,32 @@ from pathlib import Path
 from typing import Optional, Protocol
 
 from ..settings import settings
+from .embeddings import EMBEDDING_FILE
 
 log = logging.getLogger(__name__)
 
 # calibrator.pkl is optional; an uncalibrated model still serves.
+#
+# embeddings.npz is optional in the same sense: a model trained with
+# --no-embeddings ships without one and serves the neutral block. But when
+# metadata.json says uses_embeddings, an artifact without the table is
+# incomplete rather than uncalibrated. See _embeddings_required.
 MODEL_FILE = "model.json"
 CALIBRATOR_FILE = "calibrator.pkl"
 METADATA_FILE = "metadata.json"
 POINTER_FILE = "current.json"
 
 REQUIRED_FILES = (MODEL_FILE, METADATA_FILE)
-OPTIONAL_FILES = (CALIBRATOR_FILE,)
+OPTIONAL_FILES = (CALIBRATOR_FILE, EMBEDDING_FILE)
+
+
+def _embeddings_required(directory: Path) -> bool:
+    """Does this artifact's own metadata say it cannot serve without a table?"""
+    try:
+        meta = json.loads((directory / METADATA_FILE).read_text())
+    except Exception:
+        return False
+    return bool(meta.get("uses_embeddings"))
 
 
 @dataclass(frozen=True)
@@ -195,7 +210,12 @@ class S3ArtifactStore:
 
     @staticmethod
     def _is_complete(directory: Path) -> bool:
-        return all((directory / name).exists() for name in REQUIRED_FILES)
+        if not all((directory / name).exists() for name in REQUIRED_FILES):
+            return False
+        # This also guards the cache-hit path above, so a directory left by a
+        # partial earlier download is re-fetched rather than served with the
+        # embedding block gone cold.
+        return not _embeddings_required(directory) or (directory / EMBEDDING_FILE).exists()
 
     def _download(self, version: str, target: Path) -> bool:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -212,7 +232,17 @@ class S3ArtifactStore:
                         self.bucket, self._key(version, name), str(staging / name)
                     )
                 except Exception:
-                    log.info("no %s for model %s — serving uncalibrated", name, version)
+                    log.info("no %s for model %s", name, version)
+
+            # A transient failure on embeddings.npz would otherwise leave a
+            # directory ctr_model refuses forever. Version prefixes are
+            # immutable, so the cached copy is never re-fetched. Fail the
+            # download and let the next refresh tick retry.
+            if not self._is_complete(staging):
+                raise RuntimeError(
+                    f"model {version} declares uses_embeddings but "
+                    f"{EMBEDDING_FILE} did not download"
+                )
 
             # Atomic when the target does not exist and both are on the same
             # filesystem, which staging being inside cache_dir guarantees.
